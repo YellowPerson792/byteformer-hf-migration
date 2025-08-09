@@ -13,8 +13,11 @@ byteformer-hf-migration/
 │   └── conv_kernel_size=4,window_sizes=[128].yaml
 ├── weights/                          # 预训练权重（需要手动下载）
 │   └── README.md                     # 权重文件说明
+├── setup.py                         # 环境设置和检查脚本
+├── deploy.sh                        # 部署和GitHub设置脚本
 ├── utils/                           # 工具函数
-│   └── hf_adapter_utils.py          # HF适配器（来自CoreNet）
+│   ├── hf_adapter_utils.py          # HF适配器（来自CoreNet）
+│   └── path_config.py               # 路径配置和依赖管理
 ├── scripts/                         # 主要脚本
 │   ├── test_hf_byteformer_migration.py    # 完整迁移脚本
 │   ├── hf_byteformer_usage_examples.py    # 使用示例
@@ -25,26 +28,43 @@ byteformer-hf-migration/
 
 ## 🚀 快速开始
 
-### 1. 安装依赖
+### 1. 环境检查
+
+首先运行环境设置脚本检查所有依赖：
+
+```bash
+python setup.py
+```
+
+### 2. 安装依赖（如果需要）
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 2. 准备权重文件
+### 3. 配置CoreNet路径
 
-将预训练权重文件复制到 `weights/` 目录：
-- `imagenet_jpeg_q60_k4_w128.pt`
-
-### 3. 运行迁移
+如果CoreNet不在默认位置，设置环境变量：
 
 ```bash
-python scripts/test_hf_byteformer_migration.py
+export CORENET_PATH=/path/to/your/corenet
 ```
 
-### 4. 查看使用示例
+### 4. 准备权重文件
+
+确保权重文件在正确位置：
+- `weights/imagenet_jpeg_q60_k4_w128.pt`
+
+### 5. 运行迁移和测试
 
 ```bash
+# 完整迁移测试
+python scripts/test_hf_byteformer_migration.py
+
+# 简单推理示例
+python examples/simple_inference.py
+
+# 详细使用示例
 python scripts/hf_byteformer_usage_examples.py
 ```
 

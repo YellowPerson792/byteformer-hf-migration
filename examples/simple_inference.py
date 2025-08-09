@@ -6,7 +6,22 @@
 
 import sys
 import os
-sys.path.append('/root/autodl-tmp/corenet')  # 添加CoreNet路径
+from pathlib import Path
+
+# 添加utils路径
+current_dir = Path(__file__).parent
+sys.path.insert(0, str(current_dir.parent))
+
+# 设置CoreNet路径和检查依赖
+from utils.path_config import setup_corenet_path, get_config_file_path, get_weights_file_path, check_dependencies
+
+# 初始化路径配置
+try:
+    check_dependencies()
+    setup_corenet_path()
+except Exception as e:
+    print(f"❌ 初始化失败: {e}")
+    sys.exit(1)
 
 import torch
 from corenet.options.opts import get_training_arguments
@@ -15,18 +30,19 @@ from corenet.utils.hf_adapter_utils import CorenetToHFPretrainedConfig, CorenetT
 def main():
     print("=== ByteFormer HF 简单推理示例 ===\n")
     
-    # 1. 配置路径
-    config_file = "../configs/conv_kernel_size=4,window_sizes=[128].yaml"
-    weights_file = "../weights/imagenet_jpeg_q60_k4_w128.pt"
-    
-    # 检查文件是否存在
-    if not os.path.exists(weights_file):
-        print(f"❌ 权重文件不存在: {weights_file}")
-        print("请将权重文件复制到 weights/ 目录")
+    # 1. 动态路径配置
+    try:
+        config_file = get_config_file_path()
+        weights_file = get_weights_file_path()
+    except FileNotFoundError as e:
+        print(f"❌ 文件路径错误: {e}")
         return
     
+    print(f"✓ 配置文件: {config_file}")
+    print(f"✓ 权重文件: {weights_file}")
+    
     # 2. 加载模型
-    print("加载模型...")
+    print("\n加载模型...")
     args = [
         "--common.config-file", config_file,
         "--model.classification.pretrained", weights_file

@@ -3,6 +3,25 @@
 ByteFormer HuggingFace使用示例
 展示如何在HF框架下使用已迁移的ByteFormer模型
 """
+import sys
+import os
+from pathlib import Path
+
+# 添加utils路径
+current_dir = Path(__file__).parent
+sys.path.insert(0, str(current_dir.parent))
+
+# 设置CoreNet路径和检查依赖
+from utils.path_config import setup_corenet_path, get_config_file_path, get_weights_file_path, check_dependencies
+
+# 初始化路径配置
+try:
+    check_dependencies()
+    setup_corenet_path()
+except Exception as e:
+    print(f"❌ 初始化失败: {e}")
+    sys.exit(1)
+
 import torch
 from corenet.options.opts import get_training_arguments
 from corenet.utils.hf_adapter_utils import CorenetToHFPretrainedConfig, CorenetToHFPretrainedModel
@@ -11,13 +30,18 @@ def load_byteformer_hf_model():
     """加载已迁移的ByteFormer HF模型"""
     print("=== 加载ByteFormer HuggingFace模型 ===\n")
     
-    # 1. 配置文件路径
-    config_file = "/root/autodl-tmp/corenet/projects/byteformer/imagenet_jpeg_q60/conv_kernel_size=4,window_sizes=[128].yaml"
+    # 1. 使用动态路径配置
+    try:
+        config_file = get_config_file_path()
+        weights_file = get_weights_file_path()
+    except FileNotFoundError as e:
+        print(f"❌ 文件路径错误: {e}")
+        return None, None
     
     # 2. 获取CoreNet配置
     args = [
         "--common.config-file", config_file,
-        "--model.classification.pretrained", "/root/autodl-tmp/corenet/weights/imagenet_jpeg_q60_k4_w128.pt"
+        "--model.classification.pretrained", weights_file
     ]
     opts = get_training_arguments(args=args)
     
@@ -27,7 +51,7 @@ def load_byteformer_hf_model():
     model = CorenetToHFPretrainedModel(hf_config, vocab_size)
     
     # 4. 加载预训练权重
-    weights = torch.load('/root/autodl-tmp/corenet/weights/imagenet_jpeg_q60_k4_w128.pt', map_location='cpu')
+    weights = torch.load(weights_file, map_location='cpu')
     model.model.load_state_dict(weights, strict=True)
     model.eval()
     

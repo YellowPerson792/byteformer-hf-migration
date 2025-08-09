@@ -3,6 +3,25 @@
 ByteFormer HuggingFace迁移脚本
 直接加载CoreNet模型并封装为HF模型，确保能加载预训练权重
 """
+import sys
+import os
+from pathlib import Path
+
+# 添加utils路径
+current_dir = Path(__file__).parent
+sys.path.insert(0, str(current_dir.parent))
+
+# 设置CoreNet路径和检查依赖
+from utils.path_config import setup_corenet_path, get_config_file_path, get_weights_file_path, check_dependencies
+
+# 初始化路径配置
+try:
+    check_dependencies()
+    setup_corenet_path()
+except Exception as e:
+    print(f"❌ 初始化失败: {e}")
+    sys.exit(1)
+
 import torch
 import argparse
 from corenet.options.opts import get_training_arguments
@@ -11,13 +30,18 @@ from corenet.utils.hf_adapter_utils import CorenetToHFPretrainedConfig, CorenetT
 def main():
     print("=== ByteFormer 到 HuggingFace 框架迁移 ===\n")
     
-    # 1. 使用真实的配置文件路径
-    config_file = "/root/autodl-tmp/corenet/projects/byteformer/imagenet_jpeg_q60/conv_kernel_size=4,window_sizes=[128].yaml"
+    # 1. 使用动态路径配置
+    try:
+        config_file = get_config_file_path()
+        weights_path = get_weights_file_path()
+    except FileNotFoundError as e:
+        print(f"❌ 文件路径错误: {e}")
+        return False
     
     # 2. 模拟命令行参数
     args = [
         "--common.config-file", config_file,
-        "--model.classification.pretrained", "/root/autodl-tmp/corenet/weights/imagenet_jpeg_q60_k4_w128.pt"
+        "--model.classification.pretrained", weights_path
     ]
     
     # 3. 获取完整的CoreNet配置
@@ -42,7 +66,6 @@ def main():
     
     # 7. 加载预训练权重
     print("\n加载预训练权重...")
-    weights_path = "/root/autodl-tmp/corenet/weights/imagenet_jpeg_q60_k4_w128.pt"
     weights = torch.load(weights_path, map_location='cpu')
     
     # 8. 直接加载权重到CoreNet模型部分
