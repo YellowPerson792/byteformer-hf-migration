@@ -1,22 +1,14 @@
 #
-# For licensing see accompanying LICENSE file.
+# For licensing seclass CorenetToHFPretrainedConfig(PretrainedConfig): LICENSE file.
 # Copyright (C) 2024 Apple Inc. All Rights Reserved.
 #
-
 import argparse
 from typing import Any, Dict, List, Optional, Tuple
-
 import torch
-
 from corenet.modeling.models import get_model
-
-try:
-    from transformers import PretrainedConfig, PreTrainedModel
-    from transformers.modeling_outputs import CausalLMOutputWithPast
-except ModuleNotFoundError:
-    PretrainedConfig = object
-    PreTrainedModel = object
-    CausalLMOutputWithPast = None
+from corenet.modeling.models.classification.config.byteformer import get_configuration
+from transformers import PretrainedConfig, PreTrainedModel
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 
 class CorenetToHFPretrainedConfig(PretrainedConfig):
@@ -30,9 +22,55 @@ class CorenetToHFPretrainedConfig(PretrainedConfig):
         kwargs: Arguments to pass to PretrainedConfig.
     """
 
-    model_type = "causal_lm"
+    model_type = "byteformer"
 
     def __init__(self, **kwargs: Dict[str, Any]) -> None:
+        # 设置 transformers 需要的标准参数
+        # 如果是从已保存的配置加载（没有复杂的 CoreNet 参数），使用默认值
+        if any(key.startswith('model.') for key in kwargs.keys()):
+            # 从 opts 中提取 ByteFormer 的配置参数
+            try:
+                # 创建一个临时的 opts 对象来获取配置
+                temp_opts = argparse.Namespace(**kwargs)
+                byteformer_config = get_configuration(temp_opts)
+                
+                # 设置 transformers 需要的标准参数
+                self.hidden_size = byteformer_config.get("embed_dim", 768)
+                self.num_hidden_layers = byteformer_config.get("n_transformer_layers", 12)
+                self.num_attention_heads = byteformer_config.get("n_attn_heads", 12)
+                self.intermediate_size = byteformer_config.get("ffn_dim", 3072)
+                self.hidden_dropout_prob = byteformer_config.get("dropout", 0.1)
+                self.attention_probs_dropout_prob = byteformer_config.get("attn_dropout", 0.1)
+                self.max_position_embeddings = getattr(temp_opts, "model.classification.byteformer.max_num_tokens", 50000)
+                self.vocab_size = getattr(temp_opts, "model.classification.byteformer.vocab_size", 257)
+            except:
+                # 如果无法从 CoreNet 配置获取，使用默认值
+                self.hidden_size = kwargs.get("hidden_size", 768)
+                self.num_hidden_layers = kwargs.get("num_hidden_layers", 12)
+                self.num_attention_heads = kwargs.get("num_attention_heads", 12)
+                self.intermediate_size = kwargs.get("intermediate_size", 3072)
+                self.hidden_dropout_prob = kwargs.get("hidden_dropout_prob", 0.1)
+                self.attention_probs_dropout_prob = kwargs.get("attention_probs_dropout_prob", 0.1)
+                self.max_position_embeddings = kwargs.get("max_position_embeddings", 50000)
+                self.vocab_size = kwargs.get("vocab_size", 257)
+        else:
+            # 简单参数，直接使用
+            self.hidden_size = kwargs.get("hidden_size", 768)
+            self.num_hidden_layers = kwargs.get("num_hidden_layers", 12)
+            self.num_attention_heads = kwargs.get("num_attention_heads", 12)
+            self.intermediate_size = kwargs.get("intermediate_size", 3072)
+            self.hidden_dropout_prob = kwargs.get("hidden_dropout_prob", 0.1)
+            self.attention_probs_dropout_prob = kwargs.get("attention_probs_dropout_prob", 0.1)
+            self.max_position_embeddings = kwargs.get("max_position_embeddings", 50000)
+            self.vocab_size = kwargs.get("vocab_size", 257)
+        
+        self.layer_norm_eps = kwargs.get("layer_norm_eps", 1e-12)
+        self.initializer_range = kwargs.get("initializer_range", 0.02)
+        self.use_cache = kwargs.get("use_cache", True)
+        self.pad_token_id = kwargs.get("pad_token_id", 0)
+        self.bos_token_id = kwargs.get("bos_token_id", 1)
+        self.eos_token_id = kwargs.get("eos_token_id", 2)
+        
         super().__init__(**kwargs)
 
 

@@ -1,0 +1,475 @@
+"""
+ByteFormer + GPT2 Caption Training Script
+使用ByteFormer作为encoder，GPT2作为decoder实现图像描述生成任务
+
+示例运行命令：
+python byteformer-hf-migration/scripts/train_byteformer_gpt2_caption.py --per_device_train_batch_size 8 --per_device_eval_batch_size 16 --num_train_epochs 3 --learning_rate 5e-5 --eval_steps 200 --logging_steps 50 --save_steps 600 --lr_scheduler_type linear --gradient_accumulation_steps 2 --report_to none --max_caption_length 16 --num_eval_samples 50
+"""
+
+import sys
+import os
+import argparse
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torchvision import transforms
+from datasets import load_dataset
+from PIL import Image
+import numpy as np
+from dataclasses import dataclass, field
+from typing import Optional, Dict, Union
+from corenet.options.opts import get_training_arguments
+from utils.hf_adapter_utils import CorenetToHFPretrainedConfig, CorenetToHFPretrainedModel
+from corenet.data.transforms.image_bytes import PILSave
+from corenet.data.collate_fns.byteformer_collate_functions import byteformer_image_collate_fn
+from utils.hf_style_trainer import MySeq2SeqTrainer, MySeq2SeqTrainingArguments
+from transformers import GPT2LMHeadModel, GPT2Config, AutoTokenizer, EncoderDecoderModel, GenerationConfig
+from transformers.models.encoder_decoder.configuration_encoder_decoder import EncoderDecoderConfig
+from transformers.generation.utils import GenerationMixin
+from transformers import PreTrainedModel
+from peft import get_peft_model, LoraConfig, TaskType
+import evaluate
+import nltk
+from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
+import torchtext
+torchtext.disable_torchtext_deprecation_warning()
+
+# 注册到 transformers AutoConfig 和 AutoModel
+from transformers import AutoConfig, AutoModel
+from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+from transformers.models.auto.modeling_auto import MODEL_MAPPING
+
+# 注册 config
+CONFIG_MAPPING.register("byteformer", CorenetToHFPretrainedConfig)
+# 注册 model
+MODEL_MAPPING.register(CorenetToHFPretrainedConfig, CorenetToHFPretrainedModel)
+
+
+class ByteFormerWrapper(PreTrainedModel):
+    """ByteFormer包装器，适配HuggingFace EncoderDecoderModel接口
+    
+    精确复用CoreNet ByteFormer的实现，只是去掉分类头，保留完整的特征表示
+    """
+    
+    def __init__(self, byteformer_model, config):
+        super().__init__(config)
+        self.byteformer = byteformer_model
+        self.config = config
+        # 设置必要的属性
+        self.main_input_name = "input_ids"
+        
+    def forward(self, input_ids, attention_mask=None, **kwargs):
+        """
+        前向传播，复用ByteFormer的backbone，但返回序列特征而不是分类结果
+        
+        Args:
+            input_ids: 输入token序列 [batch_size, sequence_length]
+            attention_mask: 注意力掩码 (未使用，ByteFormer内部处理掩码)
+            
+        Returns:
+            BaseModelOutput: 包含last_hidden_state的输出
+        """
+        # 步骤1: 获取backbone输入 (embeddings + positional embeddings)
+        x, key_padding_mask = self.byteformer.get_backbone_inputs(input_ids)
+        
+        # 步骤2: 通过transformer backbone
+        x, updated_mask = self.byteformer.backbone_forward(x, key_padding_mask)
+        
+        # 步骤3: 返回完整的序列特征，而不是池化后的分类特征
+        # x的形状是 [batch_size, sequence_length, hidden_size]
+        # 这样可以给decoder提供更丰富的信息
+        
+        # 返回符合HuggingFace格式的输出
+        from transformers.modeling_outputs import BaseModelOutput
+        return BaseModelOutput(
+            last_hidden_state=x,
+            # 可选：添加注意力掩码信息
+            # attentions=None,  # ByteFormer不返回attention weights
+        )
+    
+    def get_output_embeddings(self):
+        return None
+    
+    def set_output_embeddings(self, x):
+        pass
+    
+    def gradient_checkpointing_enable(self):
+        pass
+    
+    def gradient_checkpointing_disable(self):
+        pass
+    
+    def _set_gradient_checkpointing(self, module, value):
+        pass
+    
+    def tie_weights(self):
+        pass
+
+
+def parse_args():
+    """解析命令行参数"""
+    parser = argparse.ArgumentParser(description="ByteFormer + GPT2 Caption Training")
+    parser.add_argument("--config", type=str, default="byteformer-hf-migration/configs/conv_kernel_size=4,window_sizes=[128].yaml", help="CoreNet配置文件路径")
+    parser.add_argument("--weights", type=str, default="byteformer-hf-migration/weights/imagenet_jpeg_q60_k4_w128.pt", help="预训练权重文件路径")
+    parser.add_argument("--gpt2_model", type=str, default="gpt2", help="GPT2模型名称")
+    parser.add_argument("--dataset_name", type=str, default="jxie/flickr8k", help="数据集名称")
+    parser.add_argument("--num_train_samples", type=int, default=None, help="训练样本数量（None表示使用全部训练数据）")
+    parser.add_argument("--num_eval_samples", type=int, default=None, help="评估样本数量（None表示使用全部验证数据）")
+    parser.add_argument("--max_caption_length", type=int, default=50, help="最大caption长度")
+    parser.add_argument("--max_byteformer_length", type=int, default=2048, help="ByteFormer最大输入长度")
+    parser.add_argument("--output_dir", type=str, default="./byteformer_gpt2_caption", help="训练输出目录")
+    parser.add_argument("--num_train_epochs", type=int, default=3, help="训练轮数")
+    parser.add_argument("--per_device_train_batch_size", type=int, default=4, help="每设备训练批大小")
+    parser.add_argument("--per_device_eval_batch_size", type=int, default=8, help="每设备验证批大小")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=2, help="梯度累积步数")
+    parser.add_argument("--learning_rate", type=float, default=5e-5, help="学习率")
+    parser.add_argument("--lr_scheduler_type", type=str, default="linear", choices=["linear", "cosine", "constant"], help="学习率调度器类型")
+    parser.add_argument("--warmup_ratio", type=float, default=0.1, help="预热比例")
+    parser.add_argument("--fp16", action="store_true", default=False, help="启用FP16混合精度")
+    parser.add_argument("--bf16", action="store_true", default=False, help="启用BF16混合精度")
+    parser.add_argument("--evaluation_strategy", type=str, default="steps", choices=["no", "steps", "epoch"], help="评估策略")
+    parser.add_argument("--eval_steps", type=int, default=100, help="评估步数间隔")
+    parser.add_argument("--logging_steps", type=int, default=50, help="日志步数间隔")
+    parser.add_argument("--save_steps", type=int, default=500, help="保存步数间隔")
+    parser.add_argument("--save_total_limit", type=int, default=3, help="保存检查点总数限制")
+    parser.add_argument("--use_lora", action="store_true", default=True, help="使用LoRA微调")
+    parser.add_argument("--lora_r", type=int, default=8, help="LoRA rank")
+    parser.add_argument("--lora_alpha", type=int, default=32, help="LoRA alpha")
+    parser.add_argument("--lora_dropout", type=float, default=0.1, help="LoRA dropout")
+    parser.add_argument("--report_to", type=str, default=None, choices=[None, "none", "wandb", "tensorboard"], help="日志报告工具")
+    return parser.parse_args()
+
+def main():
+    # Parse command line arguments
+    args = parse_args()
+    
+    print("ByteFormer + GPT2 Caption Training")
+    print("=" * 50)
+    print(f"配置文件: {args.config}")
+    print(f"预训练权重: {args.weights}")
+    print(f"输出目录: {args.output_dir}")
+    print(f"训练轮数: {args.num_train_epochs}")
+    print(f"学习率: {args.learning_rate}")
+    print(f"批大小: {args.per_device_train_batch_size}")
+    print(f"数据集: {args.dataset_name}")
+    print("=" * 50)
+    
+    # Load CoreNet configuration using args list
+    corenet_args = [
+        "--common.config-file", args.config,
+        "--model.classification.pretrained", args.weights,
+        "--model.classification.n-classes", "1000",  # 用于加载预训练权重
+        "--dataset.root-train", "./data",
+        "--dataset.root-val", "./data",
+        "--common.accum-freq", str(args.gradient_accumulation_steps),
+        "--common.log-freq", str(args.logging_steps),
+    ]
+    opts = get_training_arguments(args=corenet_args)
+    vocab_size = getattr(opts, "model.classification.byteformer.vocab_size", 257)
+    
+    # Create ByteFormer encoder (remove classification head)
+    hf_config = CorenetToHFPretrainedConfig(**vars(opts))
+    byteformer_model = CorenetToHFPretrainedModel(hf_config, vocab_size)
+    weights = torch.load(args.weights, map_location='cpu')
+    # 加载backbone部分权重
+    model_state = byteformer_model.model.state_dict()
+    pretrained_state = {k: v for k, v in weights.items() if k in model_state and model_state[k].shape == v.shape}
+    byteformer_model.model.load_state_dict(pretrained_state, strict=False)
+    
+    # Extract encoder from ByteFormer (remove classification head)
+    byteformer_encoder = byteformer_model.model
+    # Remove the classifier if it exists
+    if hasattr(byteformer_encoder, 'classifier'):
+        delattr(byteformer_encoder, 'classifier')
+    
+    # Setup GPT2 decoder with cross-attention
+    gpt2_config = GPT2Config.from_pretrained(args.gpt2_model)
+    gpt2_config.add_cross_attention = True
+    gpt2_decoder = GPT2LMHeadModel.from_pretrained(args.gpt2_model, config=gpt2_config)
+    
+    # Create ByteFormer wrapper with config - 使用 opts 获取真实配置
+    encoder_config = CorenetToHFPretrainedConfig(**vars(opts))
+    wrapped_encoder = ByteFormerWrapper(byteformer_encoder, encoder_config)
+    
+    # Create EncoderDecoderModel with wrapped encoder
+    model = EncoderDecoderModel(encoder=wrapped_encoder, decoder=gpt2_decoder)
+    
+    # Setup tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(args.gpt2_model)
+    tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.pad_token_id = tokenizer.eos_token_id  # 确保pad_token_id被正确设置
+    
+    # Configure model
+    model.config.decoder_start_token_id = tokenizer.bos_token_id
+    model.config.pad_token_id = tokenizer.pad_token_id  
+    model.config.eos_token_id = tokenizer.eos_token_id
+    model.config.vocab_size = tokenizer.vocab_size
+    model.main_input_name = "input_ids"
+    
+    # Setup generation config
+    generation_config = GenerationConfig(
+        max_length=args.max_caption_length,
+        num_beams=4,
+        no_repeat_ngram_size=3,
+        decoder_start_token_id=model.config.decoder_start_token_id,
+        bos_token_id=tokenizer.bos_token_id,
+        pad_token_id=tokenizer.pad_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+    )
+    model.generation_config = generation_config
+    
+    # 图像预处理
+    def pil_to_tensor_transform(img):
+        transform = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor()
+        ])
+        return transform(img)
+
+    # Dataset class for flickr8k caption task
+    class CaptionDataset(torch.utils.data.Dataset):
+        def __init__(self, split="train", num_samples=None, dataset_name="jxie/flickr8k"):
+            
+            # 直接使用datasets对象，不预先加载所有数据
+            self.dataset = load_dataset(dataset_name, split=split)
+            self.dataset_name = dataset_name
+            self.split = split
+            
+            # 计算总样本数（每个图片有5个caption）
+            self.total_samples = len(self.dataset) * 5
+            
+            # 如果指定了样本数量，则限制总数
+            if num_samples is not None and num_samples < self.total_samples:
+                self.total_samples = num_samples
+                print(f"使用 {split} 数据集的前 {num_samples} 个样本")
+            else:
+                print(f"使用完整的 {split} 数据集，共 {self.total_samples} 个样本")
+                
+        def __getitem__(self, idx):
+            # 动态计算对应的数据集索引和caption索引
+            dataset_idx = idx // 5  # 每个图片对应5个caption
+            caption_idx = idx % 5   # caption编号 0-4
+            
+            # 动态加载数据
+            item = self.dataset[dataset_idx]
+            
+            # 获取图片
+            img = item["image"] if "image" in item else item["jpg"]
+            if img.mode != 'RGB':
+                img = img.convert('RGB')
+            img_tensor = pil_to_tensor_transform(img)
+            
+            # 获取对应的caption
+            caption = item.get(f"caption_{caption_idx}", "")
+            
+            return {
+                'image_tensor': img_tensor,
+                'caption': caption
+            }
+            
+        def __len__(self):
+            return self.total_samples
+
+    def caption_collate_fn(batch):
+        # Custom collate function for caption task
+        images = []
+        captions = []
+        
+        for item in batch:
+            images.append(item['image_tensor'])
+            captions.append(item['caption'])
+        
+        # Process images through CoreNet pipeline (参考分类脚本的做法)
+        corenet_batch = []
+        for img_tensor in images:
+            corenet_batch.append({"samples": img_tensor, "targets": torch.tensor(0)})  # dummy target
+        
+        # Apply byteformer collate function (不使用PILSave)
+        collated = byteformer_image_collate_fn(corenet_batch, opts)
+        input_ids = collated["samples"]
+        
+        # Tokenize captions
+        caption_tokens = tokenizer(
+            captions,
+            padding='max_length',
+            max_length=args.max_caption_length,
+            truncation=True,
+            return_tensors="pt"
+        )
+        
+        # Create labels (shift right for language modeling)
+        labels = caption_tokens.input_ids.clone()
+        labels[labels == tokenizer.pad_token_id] = -100
+        
+        return {
+            "input_ids": input_ids,
+            "labels": labels,
+            "decoder_input_ids": caption_tokens.input_ids
+        }
+
+    # Create datasets
+    train_ds = CaptionDataset(split="train", num_samples=args.num_train_samples, dataset_name=args.dataset_name)
+    eval_ds = CaptionDataset(split="test", num_samples=args.num_eval_samples, dataset_name=args.dataset_name)
+    
+    # Setup LoRA if requested
+    # if args.use_lora:
+    #     lora_config = LoraConfig(
+    #         task_type=TaskType.SEQ_2_SEQ_LM,
+    #         inference_mode=False,
+    #         r=args.lora_r,
+    #         lora_alpha=args.lora_alpha,
+    #         target_modules=[
+    #             "q_proj", "k_proj", "v_proj", "o_proj",
+    #             "gate_proj", "up_proj", "down_proj", 
+    #             "c_attn", "c_proj", "c_fc"
+    #         ],
+    #         lora_dropout=args.lora_dropout
+    #     )
+    #     model = get_peft_model(model, lora_config)
+    #     model.print_trainable_parameters()
+    
+    # Enable gradient checkpointing
+    # model.gradient_checkpointing_enable()
+    
+    # Setup evaluation metrics
+    try:
+        rouge = evaluate.load("rouge")
+    except:
+        rouge = None
+        print("Rouge metric not available")
+    
+    def compute_metrics(pred):
+        labels_ids = pred.label_ids
+        pred_ids = pred.predictions
+        
+        # Convert to numpy arrays if needed
+        if not isinstance(labels_ids, np.ndarray):
+            labels_ids = np.array(labels_ids)
+        if not isinstance(pred_ids, np.ndarray):
+            pred_ids = np.array(pred_ids)
+        
+        # Decode predictions and labels
+        pred_str = tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
+        # Replace -100 with pad token for decoding
+        pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+        labels_ids = np.where(labels_ids != -100, labels_ids, pad_token_id)
+        label_str = tokenizer.batch_decode(labels_ids, skip_special_tokens=True)
+        # Compute ROUGE if available
+        results = {}
+        if rouge is not None:
+            try:
+                rouge_output = rouge.compute(predictions=pred_str, references=label_str, rouge_types=["rouge2"])
+                results["rouge2_fmeasure"] = round(rouge_output["rouge2"], 4)
+            except:
+                pass
+        # Compute BLEU scores
+        try:
+            bleu_1_scores = []
+            bleu_4_scores = []
+            for ref, pred in zip(label_str, pred_str):
+                reference = [nltk.word_tokenize(ref.lower())]
+                candidate = nltk.word_tokenize(pred.lower())
+                smoothing_function = SmoothingFunction().method4
+                bleu_1 = sentence_bleu(reference, candidate, weights=(1, 0, 0, 0), smoothing_function=smoothing_function)
+                bleu_4 = sentence_bleu(reference, candidate, weights=(0.25, 0.25, 0.25, 0.25), smoothing_function=smoothing_function)
+                bleu_1_scores.append(bleu_1)
+                bleu_4_scores.append(bleu_4)
+            
+            results.update({
+                "bleu1": round(np.mean(bleu_1_scores), 4),
+                "bleu4": round(np.mean(bleu_4_scores), 4),
+            })
+        except Exception as e:
+            print(f"BLEU计算错误: {e}")
+        
+        return results
+    
+    # Training Arguments
+    training_args = MySeq2SeqTrainingArguments(
+        output_dir=args.output_dir,
+        
+        # Basic training configuration
+        train_batch_size=args.per_device_train_batch_size,
+        eval_batch_size=args.per_device_eval_batch_size,
+        num_train_epochs=args.num_train_epochs,
+        learning_rate=args.learning_rate,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        
+        # Logging and evaluation
+        logging_steps=args.logging_steps,
+        save_steps=args.save_steps,
+        save_total_limit=args.save_total_limit,
+        eval_steps=args.eval_steps,
+        eval_strategy=args.evaluation_strategy,
+        
+        # Scheduling
+        lr_scheduler_type=args.lr_scheduler_type,
+        warmup_steps=int(args.warmup_ratio * 1000),
+        
+        # Mixed precision
+        fp16=args.fp16,
+        bf16=args.bf16,
+        
+        # Reporting
+        report_to=args.report_to if args.report_to not in [None, "none"] else None,
+    )
+    
+    # Initialize trainer
+    trainer = MySeq2SeqTrainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_ds,
+        eval_dataset=eval_ds,
+        data_collator=caption_collate_fn,
+        tokenizer=tokenizer,
+        compute_metrics=compute_metrics,
+    )
+    
+    print("开始ByteFormer + GPT2 Caption训练...")
+    print(f"训练样本数: {len(train_ds)}")
+    print(f"验证样本数: {len(eval_ds)}")
+    print(f"训练参数: {training_args}")
+    
+    # Start training
+    trainer.train()
+    
+    # Save model
+    trainer.save_model()
+    
+    print("训练完成！")
+    
+    # Generate sample captions
+    print("\\n生成样例caption...")
+    model.eval()
+    for i in range(min(3, len(eval_ds))):
+        try:
+            sample = eval_ds[i]
+            img_tensor = sample['image_tensor']
+            true_caption = sample['caption']
+            
+            # Process through pipeline
+            corenet_item = {"samples": img_tensor, "targets": torch.tensor(0)}
+            pil_save_transform = PILSave(opts)
+            processed_item = pil_save_transform(corenet_item)
+            
+            collated = byteformer_image_collate_fn([processed_item], opts)
+            input_ids = collated["samples"].long().unsqueeze(0)
+            
+            # Generate caption
+            with torch.no_grad():
+                generated_ids = model.generate(
+                    inputs=input_ids.to(model.device),
+                    generation_config=generation_config,
+                )
+                generated_caption = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
+            
+            print(f"\\n样例 {i+1}:")
+            print(f"真实caption: {true_caption}")
+            print(f"生成caption: {generated_caption}")
+            
+        except Exception as e:
+            print(f"生成样例 {i+1} 时出错: {e}")
+
+if __name__ == "__main__":
+    main()
