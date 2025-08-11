@@ -14,6 +14,7 @@ def setup_corenet_path():
     """
     # 可能的CoreNet路径
     possible_paths = [
+        "D:\\MLLMs\\corenet",
         "/root/autodl-tmp/corenet",  # 开发环境
         "/opt/corenet",              # 系统安装
         os.path.expanduser("~/corenet"),  # 用户目录

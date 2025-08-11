@@ -46,6 +46,7 @@ def main():
     corenet_paths = [
         "/root/autodl-tmp/corenet",
         "/opt/corenet",
+        "D:\\MLLMs\\corenet",
         os.path.expanduser("~/corenet"),
         "./corenet"
     ]

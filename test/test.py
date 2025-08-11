@@ -4,18 +4,19 @@
 #
 
 import argparse
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 
 from corenet.modeling.models import get_model
 
 try:
-    from transformers import PretrainedConfig, PreTrainedModel
+    from transformers import PretrainedConfig, PreTrainedModel, GenerationMixin
     from transformers.modeling_outputs import CausalLMOutputWithPast
 except ModuleNotFoundError:
     PretrainedConfig = object
     PreTrainedModel = object
+    GenerationMixin = object
     CausalLMOutputWithPast = None
 
 
@@ -57,32 +58,57 @@ class CorenetToHFPretrainedModel(PreTrainedModel):
         opts = argparse.Namespace(**vars(config))
 
         model = get_model(opts)
-        # model.eval()
+        model.eval()
 
         self.lm_head = None
         self.model = model
+        # vocab_size: 输入 embedding 表大小 (ByteFormer 默认 257)
         self.vocab_size = vocab_size
-        self.num_classes = getattr(opts, "model.classification.num_classes", 1000)  # Default to 1000 if not specified
+        # num_classes: 分类头输出类别数（来自 n_classes，若无则回退到 vocab_size）
+        self.num_classes = getattr(opts, "model.classification.n_classes", 1000)
+        # 保存到 config 便于保存/加载
+        if not hasattr(self.config, "vocab_size"):
+            setattr(self.config, "vocab_size", self.vocab_size)
+        if not hasattr(self.config, "num_classes"):
+            setattr(self.config, "num_classes", self.num_classes)
         self.post_init()
 
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[List[torch.Tensor]] = None,
-        attention_mask: Optional[torch.FloatTensor] = None,  # No need, internally apply causal masking
-        token_type_ids: Optional[torch.LongTensor] = None,  # No need, we do not differentiate between tokens
-        position_ids: Optional[torch.LongTensor] = None,  # Needed for llama mdoels, not needed for openelm
-        head_mask: Optional[torch.FloatTensor] = None,  # No need, we are not masking heads
-        inputs_embeds: Optional[torch.FloatTensor] = None,  # No need, they will be computed internally
-        encoder_hidden_states: Optional[torch.Tensor] = None,  # No need, we don't have encoder
-        encoder_attention_mask: Optional[torch.FloatTensor] = None,  # No need, we don't have encoder
-        use_cache: Optional[bool] = None,  # We can use it, map to `use_kv_cache` args internally
+        attention_mask: Optional[
+            torch.FloatTensor
+        ] = None,  # No need, internally apply causal masking
+        token_type_ids: Optional[
+            torch.LongTensor
+        ] = None,  # No need, we do not differentiate between tokens
+        position_ids: Optional[
+            torch.LongTensor
+        ] = None,  # Needed for llama mdoels, not needed for openelm
+        head_mask: Optional[
+            torch.FloatTensor
+        ] = None,  # No need, we are not masking heads
+        inputs_embeds: Optional[
+            torch.FloatTensor
+        ] = None,  # No need, they will be computed internally
+        encoder_hidden_states: Optional[
+            torch.Tensor
+        ] = None,  # No need, we don't have encoder
+        encoder_attention_mask: Optional[
+            torch.FloatTensor
+        ] = None,  # No need, we don't have encoder
+        use_cache: Optional[
+            bool
+        ] = None,  # We can use it, map to `use_kv_cache` args internally
         output_attentions: Optional[bool] = None,  # No need, we are not using them
         output_hidden_states: Optional[bool] = None,  # No need, we are not using them
-        return_dict: Optional[bool] = None,  # We can return as a dict, we internally deal with it
+        return_dict: Optional[
+            bool
+        ] = None,  # We can return as a dict, we internally deal with it
         cache_position: Optional[torch.LongTensor] = None,  # No need, not used.
-        labels: Optional[torch.LongTensor] = None,
-    ) -> CausalLMOutputWithPast:
+        labels: Optional[Union[torch.LongTensor, torch.IntTensor]] = None,
+    ):
         """
         The forward function to compute model outputs.
 
@@ -157,22 +183,28 @@ class CorenetToHFPretrainedModel(PreTrainedModel):
             logits = model_outputs
             past_key_values = None
 
-        # 分类模型输出应为 [B, num_classes]；若比 vocab_size 大则裁剪
-        # logits = logits[..., : self.num_classes]
+        # 分类模型输出应为 [B, num_classes]；若比 num_classes 大则裁剪
+        # if logits.size(-1) > self.num_classes:
+        #     logits = logits[..., : self.num_classes]
+        
+        logits = logits[..., : self.vocab_size]
 
         # 计算loss用于训练
         loss = None
         if labels is not None:
-            if logits.dim() == 2:
-                # 分类任务: logits [B, num_classes], labels [B]
+            if logits.dim() == 2 and logits.size(-1) == self.num_classes:
+                # 分类任务
                 loss = torch.nn.functional.cross_entropy(logits, labels)
             elif logits.dim() == 3:
-                # 序列生成任务: logits [B, T, vocab_size], labels [B, T]
+                # 序列任务 (未必适用于当前 ByteFormer 分类模型)
                 shift_logits = logits.view(-1, logits.size(-1))
                 shift_labels = labels.view(-1)
                 loss = torch.nn.functional.cross_entropy(
                     shift_logits, shift_labels, ignore_index=-100
                 )
+            else:
+                # 其他形状不自动计算 loss
+                pass
 
         return CausalLMOutputWithPast(
             logits=logits,
@@ -221,3 +253,22 @@ class CorenetToHFPretrainedModel(PreTrainedModel):
             "attention_mask": attention_mask,
         }
         return model_inputs
+
+    # HF Trainer兼容性方法
+    def get_input_embeddings(self):
+        """获取输入embedding层，用于HF Trainer"""
+        return getattr(self.model, "embeddings", None)
+
+    def set_input_embeddings(self, new_embeddings):
+        """设置输入embedding层，用于HF Trainer"""
+        if hasattr(self.model, "embeddings"):
+            self.model.embeddings = new_embeddings
+
+    def get_output_embeddings(self):
+        """获取输出embedding层，用于HF Trainer"""
+        return getattr(self.model, "classifier", None)
+
+    def set_output_embeddings(self, new_embeddings):
+        """设置输出embedding层，用于HF Trainer"""
+        if hasattr(self.model, "classifier"):
+            self.model.classifier = new_embeddings
