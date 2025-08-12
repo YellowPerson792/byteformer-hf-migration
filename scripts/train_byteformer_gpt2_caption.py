@@ -312,7 +312,7 @@ def main():
         
         # Print up to 5 predictions and labels for debugging
         for i, (ref, pred) in enumerate(zip(label_str, pred_str)):
-            if i in [0, 5, 10, 15, 20, 25]: 
+            if i in [0, 5, 10, 15, 20, 25]:  
                 print(f"Sample {i + 1}:")
                 print(f"  Reference: {ref}")
                 print(f"  Prediction: {pred}\n")
