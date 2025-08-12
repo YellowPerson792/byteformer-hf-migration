@@ -3,11 +3,14 @@ ByteFormer + GPT2 Caption Training Script
 使用ByteFormer作为encoder，GPT2作为decoder实现图像描述生成任务
 
 示例运行命令：
-python byteformer-hf-migration/scripts/train_byteformer_gpt2_caption.py --per_device_train_batch_size 8 --per_device_eval_batch_size 16 --num_train_epochs 3 --learning_rate 5e-5 --eval_steps 200 --logging_steps 50 --save_steps 600 --lr_scheduler_type cosine --gradient_accumulation_steps 2 --report_to none --max_caption_length 16 --num_eval_samples 50
+python byteformer-hf-migration/scripts/train_byteformer_gpt2_caption.py --per_device_train_batch_size 48 --per_device_eval_batch_size 48 --num_train_epochs 6 --learning_rate 2e-5 --eval_steps 100 --logging_steps 50 --save_steps 600 --lr_scheduler_type cosine --gradient_accumulation_steps 2 --report_to none --max_caption_length 16 --num_eval_samples 50
 """
 
-import sys
 import os
+# 设置环境变量以避免tokenizers并行化警告
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+import sys
 import argparse
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 import torch
@@ -309,7 +312,7 @@ def main():
         
         # Print up to 5 predictions and labels for debugging
         for i, (ref, pred) in enumerate(zip(label_str, pred_str)):
-            if i in [0, 1, 5, 6, 10, 11]:
+            if i in [0, 5, 10, 15, 20, 25]: 
                 print(f"Sample {i + 1}:")
                 print(f"  Reference: {ref}")
                 print(f"  Prediction: {pred}\n")
