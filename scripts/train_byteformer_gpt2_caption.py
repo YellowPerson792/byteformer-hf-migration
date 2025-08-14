@@ -3,7 +3,7 @@ ByteFormer + GPT2 Caption Training Script
 使用ByteFormer作为encoder，GPT2作为decoder实现图像描述生成任务
 
 示例运行命令：
-python byteformer-hf-migration/scripts/train_byteformer_gpt2_caption.py --per_device_train_batch_size 48 --per_device_eval_batch_size 48 --num_train_epochs 6 --learning_rate 2e-5 --eval_steps 100 --logging_steps 50 --save_steps 600 --lr_scheduler_type cosine --gradient_accumulation_steps 2 --report_to none --max_caption_length 16 --num_eval_samples 50
+python byteformer-hf-migration/scripts/train_byteformer_gpt2_caption.py --per_device_train_batch_size 48 --per_device_eval_batch_size 48 --num_train_epochs 6 --learning_rate 5e-5 --eval_steps 100 --logging_steps 50 --save_steps 600 --lr_scheduler_type cosine --gradient_accumulation_steps 2 --report_to none --max_caption_length 16 --num_eval_samples 50 --fp16
 """
 
 import os
@@ -110,7 +110,6 @@ def parse_args():
     parser.add_argument("--num_train_samples", type=int, default=None, help="训练样本数量（None表示使用全部训练数据）")
     parser.add_argument("--num_eval_samples", type=int, default=None, help="评估样本数量（None表示使用全部验证数据）")
     parser.add_argument("--max_caption_length", type=int, default=50, help="最大caption长度")
-    parser.add_argument("--max_byteformer_length", type=int, default=2048, help="ByteFormer最大输入长度")
     parser.add_argument("--output_dir", type=str, default="./byteformer_gpt2_caption", help="训练输出目录")
     parser.add_argument("--num_train_epochs", type=int, default=3, help="训练轮数")
     parser.add_argument("--per_device_train_batch_size", type=int, default=4, help="每设备训练批大小")
@@ -118,7 +117,7 @@ def parse_args():
     parser.add_argument("--gradient_accumulation_steps", type=int, default=2, help="梯度累积步数")
     parser.add_argument("--learning_rate", type=float, default=5e-5, help="学习率")
     parser.add_argument("--lr_scheduler_type", type=str, default="linear", choices=["linear", "cosine", "constant"], help="学习率调度器类型")
-    parser.add_argument("--warmup_ratio", type=float, default=0.1, help="预热比例")
+    parser.add_argument("--warmup_ratio", type=float, default=0, help="预热比例")
     parser.add_argument("--fp16", action="store_true", default=False, help="启用FP16混合精度")
     parser.add_argument("--bf16", action="store_true", default=False, help="启用BF16混合精度")
     parser.add_argument("--evaluation_strategy", type=str, default="steps", choices=["no", "steps", "epoch"], help="评估策略")
@@ -131,6 +130,7 @@ def parse_args():
     parser.add_argument("--lora_alpha", type=int, default=32, help="LoRA alpha")
     parser.add_argument("--lora_dropout", type=float, default=0.1, help="LoRA dropout")
     parser.add_argument("--report_to", type=str, default=None, choices=[None, "none", "wandb", "tensorboard"], help="日志报告工具")
+    parser.add_argument("--bit_reverse_prob", type=float, default=0.0, help="每个字节反转位的概率，默认禁用")
     return parser.parse_args()
 
 def main():
@@ -153,6 +153,7 @@ def main():
         "--model.classification.n-classes", "1000",  # 用于加载预训练权重
         "--dataset.root-train", "./data",
         "--dataset.root-val", "./data",
+        "--image-augmentation.bit-reverse.prob", str(args.bit_reverse_prob),
         "--common.accum-freq", str(args.gradient_accumulation_steps),
         "--common.log-freq", str(args.logging_steps),
     ]
@@ -194,7 +195,7 @@ def main():
     # Setup generation config
     generation_config = GenerationConfig(
         max_length=args.max_caption_length,
-        num_beams=4,
+        num_beams=5,
         no_repeat_ngram_size=3,
         decoder_start_token_id=model.config.decoder_start_token_id,
         bos_token_id=tokenizer.bos_token_id,
@@ -319,6 +320,14 @@ def main():
         
         return results
     
+    # 计算总训练步数，实现真正的 warmup_ratio
+    train_batch_size = args.per_device_train_batch_size
+    num_train_epochs = args.num_train_epochs
+    num_train_samples = len(train_ds)
+    steps_per_epoch = (num_train_samples + train_batch_size - 1) // train_batch_size
+    total_steps = steps_per_epoch * num_train_epochs
+    warmup_steps = int(total_steps * args.warmup_ratio)
+    
     # Training Arguments
     training_args = MySeq2SeqTrainingArguments(
         output_dir=args.output_dir,
@@ -333,7 +342,7 @@ def main():
         eval_steps=args.eval_steps,
         eval_strategy=args.evaluation_strategy,
         lr_scheduler_type=args.lr_scheduler_type,
-        warmup_steps=int(args.warmup_ratio * 1000),
+        warmup_steps=warmup_steps,
         fp16=args.fp16,
         bf16=args.bf16,
         report_to=args.report_to if args.report_to not in [None, "none"] else None,
@@ -344,8 +353,8 @@ def main():
         args=training_args,
         train_dataset=train_ds,
         eval_dataset=eval_ds,
-        data_collator=caption_collate_fn,
         tokenizer=tokenizer,
+        data_collator=caption_collate_fn,
         compute_metrics=compute_metrics,
     )
     
@@ -370,10 +379,8 @@ def main():
             
             # Process through pipeline
             corenet_item = {"samples": img_tensor, "targets": torch.tensor(0)}
-            pil_save_transform = PILSave(opts)
-            processed_item = pil_save_transform(corenet_item)
             
-            collated = byteformer_image_collate_fn([processed_item], opts)
+            collated = byteformer_image_collate_fn([corenet_item], opts)
             input_ids = collated["samples"].long().unsqueeze(0)
             
             # Generate caption

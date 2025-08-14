@@ -6,7 +6,7 @@ ByteFormer + GPT2 Caption Inference Script
 python byteformer-hf-migration/scripts/inference_byteformer_gpt2_caption.py \
     --model_path ./byteformer_gpt2_caption \
     --num_samples 100 \
-    --batch_size 16 \
+    --batch_size 48 \
     --num_beams 5 \
     --max_length 16
 """
@@ -217,7 +217,7 @@ def load_model_and_tokenizer(model_path: str, config_path: str, weights_path: st
 def prepare_dataset(dataset_name: str, num_samples: Optional[int] = None):
     """准备测试数据集"""
     print(f"Loading dataset: {dataset_name}")
-    dataset = load_dataset(dataset_name, split="test")
+    dataset = load_dataset(dataset_name, split="validation")
     
     if num_samples is not None:
         dataset = dataset.select(range(min(num_samples, len(dataset))))
@@ -447,7 +447,7 @@ def main():
     model, tokenizer = load_model_and_tokenizer(
         args.model_path, args.config, args.weights, device
     )
-    dataset = CaptionDataset(split="test", num_samples=args.num_samples, dataset_name=args.dataset_name)
+    dataset = CaptionDataset(split="validation", num_samples=args.num_samples, dataset_name=args.dataset_name)
 
     # 创建collate函数
     collate_fn = create_collate_fn(opts)
