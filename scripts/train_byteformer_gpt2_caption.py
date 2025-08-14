@@ -3,7 +3,7 @@ ByteFormer + GPT2 Caption Training Script
 使用ByteFormer作为encoder，GPT2作为decoder实现图像描述生成任务
 
 示例运行命令：
-python byteformer-hf-migration/scripts/train_byteformer_gpt2_caption.py --per_device_train_batch_size 8 --per_device_eval_batch_size 8 --num_train_epochs 3 --learning_rate 5e-5 --eval_steps 600 --logging_steps 50 --save_steps 600 --lr_scheduler_type cosine --gradient_accumulation_steps 2 --report_to none --max_caption_length 16 --num_eval_samples 50 --fp16
+python byteformer-hf-migration/scripts/train_byteformer_gpt2_caption.py --per_device_train_batch_size 48 --per_device_eval_batch_size 48 --num_train_epochs 6 --learning_rate 5e-5 --eval_steps 100 --logging_steps 50 --save_steps 600 --lr_scheduler_type cosine --gradient_accumulation_steps 2 --report_to none --max_caption_length 16 --num_eval_samples 50 --fp16
 """
 
 import os
@@ -110,7 +110,6 @@ def parse_args():
     parser.add_argument("--num_train_samples", type=int, default=None, help="训练样本数量（None表示使用全部训练数据）")
     parser.add_argument("--num_eval_samples", type=int, default=None, help="评估样本数量（None表示使用全部验证数据）")
     parser.add_argument("--max_caption_length", type=int, default=50, help="最大caption长度")
-    parser.add_argument("--max_byteformer_length", type=int, default=2048, help="ByteFormer最大输入长度")
     parser.add_argument("--output_dir", type=str, default="./byteformer_gpt2_caption", help="训练输出目录")
     parser.add_argument("--num_train_epochs", type=int, default=3, help="训练轮数")
     parser.add_argument("--per_device_train_batch_size", type=int, default=4, help="每设备训练批大小")
@@ -131,6 +130,7 @@ def parse_args():
     parser.add_argument("--lora_alpha", type=int, default=32, help="LoRA alpha")
     parser.add_argument("--lora_dropout", type=float, default=0.1, help="LoRA dropout")
     parser.add_argument("--report_to", type=str, default=None, choices=[None, "none", "wandb", "tensorboard"], help="日志报告工具")
+    parser.add_argument("--bit_reverse_prob", type=float, default=0.0, help="每个字节反转位的概率，默认禁用")
     return parser.parse_args()
 
 def main():
@@ -153,6 +153,7 @@ def main():
         "--model.classification.n-classes", "1000",  # 用于加载预训练权重
         "--dataset.root-train", "./data",
         "--dataset.root-val", "./data",
+        "--image-augmentation.bit-reverse.prob", str(args.bit_reverse_prob),
         "--common.accum-freq", str(args.gradient_accumulation_steps),
         "--common.log-freq", str(args.logging_steps),
     ]

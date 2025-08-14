@@ -249,12 +249,13 @@ class MySeq2SeqTrainer:
                 
                 with torch.cuda.amp.autocast(enabled=use_amp, dtype=torch.bfloat16 if args.bf16 else torch.float16):
                     outputs = self.model(**model_inputs)
-                    loss = outputs.loss / args.gradient_accumulation_steps
+                    loss = outputs.loss  # 不再除以gradient_accumulation_steps
+                    scaled_loss = loss / args.gradient_accumulation_steps  # 用于反向传播的缩放损失
                 if use_amp:
-                    scaler.scale(loss).backward()
+                    scaler.scale(scaled_loss).backward()
                 else:
-                    loss.backward()
-                loss_accumulated += loss.item()
+                    scaled_loss.backward()
+                loss_accumulated += loss.item()  # 累积真实损失
                 if (step + 1) % args.gradient_accumulation_steps == 0 or (step + 1) == len(train_loader):
                     grad_norm = self._compute_grad_norm()
                     if use_amp:
@@ -265,36 +266,37 @@ class MySeq2SeqTrainer:
                     scheduler.step()
                     optimizer.zero_grad()
                     optimizer_step += 1  # 真正的optimizer step计数
-                epoch_loss += loss.item() * args.gradient_accumulation_steps
+                epoch_loss += loss.item()  # 累积真实损失
                 global_step += 1  # batch step计数
                 progress_bar.update(1)
                 real_epoch = epoch + (step + 1) / len(train_loader)
                 progress_bar.set_postfix({
                     "ep": f"{real_epoch:.2f}/{args.num_train_epochs}",
                     "step": global_step,
-                    "loss": f"{loss.item() * args.gradient_accumulation_steps:.4f}",
+                    "loss": f"{loss.item():.4f}",  # 显示真实损失
                     "lr": f"{scheduler.get_last_lr()[0]:.2e}"
                 })
                 if args.logging_steps > 0 and global_step % args.logging_steps == 0:
-                    current_loss = loss_accumulated
+                    # 计算平均损失（在梯度累积步数上平均）
+                    avg_loss = loss_accumulated / args.gradient_accumulation_steps if (step + 1) % args.gradient_accumulation_steps == 0 else loss_accumulated / ((step % args.gradient_accumulation_steps) + 1)
                     # 计算真实epoch进度
                     real_epoch = epoch + (step + 1) / len(train_loader)
                     log_str = (
                         f"[Batch {global_step:>5}] [Opt {optimizer_step:>4}] [Ep {real_epoch:>6.3f}] | "
-                        f"Loss: {current_loss:>7.4f} | GradNorm: {grad_norm:>7.3f} | LR: {scheduler.get_last_lr()[0]:.2e}"
+                        f"Loss: {avg_loss:>7.4f} | GradNorm: {grad_norm:>7.3f} | LR: {scheduler.get_last_lr()[0]:.2e}"
                     )
                     tqdm.write(log_str)
                     # 日志上报 (按HF标准格式)
                     if self._wandb is not None:
                         self._wandb.log({
-                            'train/loss': current_loss,
+                            'train/loss': avg_loss,
                             'train/grad_norm': grad_norm,
                             'train/learning_rate': scheduler.get_last_lr()[0],
                             'train/epoch': real_epoch,
                             'train/global_step': global_step
                         }, step=global_step)
                     if self._tb_writer is not None:
-                        self._tb_writer.add_scalar('train/loss', current_loss, global_step)
+                        self._tb_writer.add_scalar('train/loss', avg_loss, global_step)
                         self._tb_writer.add_scalar('train/grad_norm', grad_norm, global_step)
                         self._tb_writer.add_scalar('train/learning_rate', scheduler.get_last_lr()[0], global_step)
                 if (step + 1) % args.gradient_accumulation_steps == 0: 
@@ -412,18 +414,14 @@ class MySeq2SeqTrainer:
         raise ValueError(f"Unsupported lr_scheduler_type: {self.args.lr_scheduler_type}")
 
     def _compute_grad_norm(self):
-        """计算模型梯度范数"""
-        total_norm = 0.0
-        param_count = 0
-        for p in self.model.parameters():
-            if p.grad is not None:
-                param_norm = p.grad.data.norm(2)
-                total_norm += param_norm.item() ** 2
-                param_count += 1
-        
-        if param_count == 0:
+        """计算模型梯度范数 - 使用torch.nn.utils.clip_grad_norm_的计算方式"""
+        parameters = [p for p in self.model.parameters() if p.grad is not None]
+        if len(parameters) == 0:
             return 0.0
-        return total_norm ** 0.5
+        
+        device = parameters[0].grad.device
+        total_norm = torch.norm(torch.stack([torch.norm(p.grad.detach(), 2.0).to(device) for p in parameters]), 2.0)
+        return total_norm.item()
 
 import os
 import shutil
