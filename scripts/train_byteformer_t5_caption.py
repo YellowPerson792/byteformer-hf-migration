@@ -3,7 +3,7 @@ ByteFormer + T5 Caption Training Script
 使用ByteFormer作为encoder，T5作为decoder实现图像描述生成任务
 
 示例运行命令：
-python byteformer-hf-migration/scripts/train_byteformer_t5_caption.py --per_device_train_batch_size 8 --per_device_eval_batch_size 8 --num_train_epochs 3 --learning_rate 5e-5 --eval_steps 600 --logging_steps 50 --save_steps 600 --lr_scheduler_type cosine --gradient_accumulation_steps 2 --report_to none --max_caption_length 16 --num_eval_samples 50 --fp16
+python byteformer-hf-migration/scripts/train_byteformer_t5_caption.py --per_device_train_batch_size 8 --per_device_eval_batch_size 8 --num_train_epochs 3 --learning_rate 5e-5 --eval_steps 200 --logging_steps 50 --save_steps 600 --lr_scheduler_type cosine --gradient_accumulation_steps 2 --report_to none --max_caption_length 16 --num_eval_samples 50 --fp16
 """
 
 import os
@@ -27,6 +27,8 @@ from corenet.data.transforms.image_bytes import PILSave
 from corenet.data.collate_fns.byteformer_collate_functions import byteformer_image_collate_fn
 from utils.hf_style_trainer import MySeq2SeqTrainer, MySeq2SeqTrainingArguments
 from transformers import T5ForConditionalGeneration, T5Tokenizer, EncoderDecoderModel, GenerationConfig
+from transformers.modeling_outputs import Seq2SeqLMOutput, BaseModelOutput
+from transformers import PreTrainedModel
 from peft import get_peft_model, LoraConfig, TaskType
 import evaluate
 import nltk
@@ -41,19 +43,130 @@ from transformers.models.auto.modeling_auto import MODEL_MAPPING
 CONFIG_MAPPING.register("byteformer", CorenetToHFPretrainedConfig)
 MODEL_MAPPING.register(CorenetToHFPretrainedConfig, CorenetToHFPretrainedModel)
 
-class ByteFormerWrapper(nn.Module):
-    def get_output_embeddings(self):
-        return None
-    def __init__(self, byteformer_model, config):
-        super().__init__()
-        self.byteformer = byteformer_model
-        self.config = config
+class ByteFormerT5Model(PreTrainedModel):
+    def __init__(self, byteformer_encoder, t5_model, tokenizer):
+        super().__init__(t5_model.config)
+        self.byteformer_encoder = byteformer_encoder
+        self.t5_model = t5_model
+        self.tokenizer = tokenizer
+        
+        # 添加投影层，将ByteFormer的输出投影到T5的维度
+        byteformer_dim = 192  # ByteFormer输出维度，需要根据实际配置调整
+        t5_dim = t5_model.config.d_model
+        self.projection = nn.Linear(byteformer_dim, t5_dim)
+        
         self.main_input_name = "input_ids"
-    def forward(self, input_ids, attention_mask=None, **kwargs):
-        x, key_padding_mask = self.byteformer.get_backbone_inputs(input_ids)
-        x, updated_mask = self.byteformer.backbone_forward(x, key_padding_mask)
-        from transformers.modeling_outputs import BaseModelOutput
-        return BaseModelOutput(last_hidden_state=x)
+        
+        # 设置generation_config，确保evaluate时能进入generate分支
+        from transformers import GenerationConfig
+        self.generation_config = GenerationConfig(
+            max_length=16,      # 最大生成长度，与max_caption_length保持一致
+            max_new_tokens=16,  # 新生成的token数量
+            num_beams=1,        # 使用贪婪搜索而非beam search
+            do_sample=False,    # 不使用采样
+            pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+            forced_eos_token_id=tokenizer.eos_token_id,  # 强制结束token
+        )
+        
+    def forward(self, input_ids=None, labels=None, attention_mask=None, decoder_input_ids=None, 
+                decoder_attention_mask=None, **kwargs):
+        
+        # 1. 通过ByteFormer encoder获取图像特征
+        x, key_padding_mask = self.byteformer_encoder.get_backbone_inputs(input_ids)
+        encoder_outputs, updated_mask = self.byteformer_encoder.backbone_forward(x, key_padding_mask)
+        
+        # 2. 投影到T5维度
+        encoder_outputs = self.projection(encoder_outputs)  # [batch, seq_len, t5_dim]
+        
+        # 3. 创建encoder的attention mask
+        batch_size, seq_len = encoder_outputs.shape[:2]
+        encoder_attention_mask = torch.ones(batch_size, seq_len, device=encoder_outputs.device)
+        
+        # 4. 使用T5进行生成
+        if labels is not None:
+            # 训练模式
+            outputs = self.t5_model(
+                encoder_outputs=BaseModelOutput(last_hidden_state=encoder_outputs),
+                attention_mask=encoder_attention_mask,
+                labels=labels,
+                decoder_input_ids=decoder_input_ids,
+                decoder_attention_mask=decoder_attention_mask,
+                **kwargs
+            )
+        else:
+            # 推理模式
+            outputs = self.t5_model(
+                encoder_outputs=BaseModelOutput(last_hidden_state=encoder_outputs),
+                attention_mask=encoder_attention_mask,
+                decoder_input_ids=decoder_input_ids,
+                decoder_attention_mask=decoder_attention_mask,
+                **kwargs
+            )
+            
+        return outputs
+    
+    def generate(self, input_ids=None, encoder_outputs=None, **kwargs):
+        """
+        生成方法，支持两种调用方式：
+        1. 直接传入input_ids: generate(input_ids=...)
+        2. 传入预计算的encoder_outputs: generate(encoder_outputs=...)
+        统一使用self.generation_config，允许kwargs覆盖。
+        """
+        # 统一生成参数
+        gen_config = self.generation_config
+        # 允许外部传入generation_config或单独参数覆盖
+        if 'generation_config' in kwargs:
+            gen_config = kwargs.pop('generation_config')
+        # 其余参数优先级高于config
+        gen_kwargs = dict()
+        if gen_config is not None:
+            gen_kwargs.update(gen_config.to_dict())
+        gen_kwargs.update(kwargs)
+
+        if encoder_outputs is not None:
+            # 如果已经有encoder_outputs，直接使用（来自trainer的evaluate方法）
+            if hasattr(encoder_outputs, 'last_hidden_state'):
+                projected_outputs = self.projection(encoder_outputs.last_hidden_state)
+            else:
+                projected_outputs = self.projection(encoder_outputs)
+            # 创建attention mask
+            batch_size, seq_len = projected_outputs.shape[:2]
+            encoder_attention_mask = torch.ones(batch_size, seq_len, device=projected_outputs.device)
+            return self.t5_model.generate(
+                encoder_outputs=BaseModelOutput(last_hidden_state=projected_outputs),
+                attention_mask=encoder_attention_mask,
+                **gen_kwargs
+            )
+        elif input_ids is not None:
+            # 如果传入input_ids，先通过ByteFormer encoder处理
+            x, key_padding_mask = self.byteformer_encoder.get_backbone_inputs(input_ids)
+            encoder_outputs, updated_mask = self.byteformer_encoder.backbone_forward(x, key_padding_mask)
+            encoder_outputs = self.projection(encoder_outputs)
+            # 创建attention mask
+            batch_size, seq_len = encoder_outputs.shape[:2]
+            encoder_attention_mask = torch.ones(batch_size, seq_len, device=encoder_outputs.device)
+            return self.t5_model.generate(
+                encoder_outputs=BaseModelOutput(last_hidden_state=encoder_outputs),
+                attention_mask=encoder_attention_mask,
+                **gen_kwargs
+            )
+        else:
+            raise ValueError("必须提供 input_ids 或 encoder_outputs 中的一个")
+    
+    def get_encoder(self):
+        return self.byteformer_encoder
+    
+    def get_decoder(self):
+        return self.t5_model.decoder
+    
+    def to(self, device):
+        """确保所有组件都移动到指定设备"""
+        super().to(device)
+        self.byteformer_encoder = self.byteformer_encoder.to(device)
+        self.t5_model = self.t5_model.to(device)
+        self.projection = self.projection.to(device)
+        return self
 
 def parse_args():
     parser = argparse.ArgumentParser(description="ByteFormer + T5 Caption Training")
@@ -119,28 +232,20 @@ def main():
     byteformer_encoder = byteformer_model.model
     if hasattr(byteformer_encoder, 'classifier'):
         delattr(byteformer_encoder, 'classifier')
-    t5_decoder = T5ForConditionalGeneration.from_pretrained(args.t5_model)
-    encoder_config = CorenetToHFPretrainedConfig(**vars(opts))
-    wrapped_encoder = ByteFormerWrapper(byteformer_encoder, encoder_config)
-    model = EncoderDecoderModel(encoder=wrapped_encoder, decoder=t5_decoder)
+    t5_model = T5ForConditionalGeneration.from_pretrained(args.t5_model)
     tokenizer = T5Tokenizer.from_pretrained(args.t5_model)
-    tokenizer.pad_token = tokenizer.pad_token
-    tokenizer.pad_token_id = tokenizer.pad_token_id
+    
+    # 创建自定义的ByteFormer+T5模型
+    model = ByteFormerT5Model(byteformer_encoder, t5_model, tokenizer)
+    
+    # 设置模型配置
     model.config.decoder_start_token_id = tokenizer.pad_token_id
     model.config.pad_token_id = tokenizer.pad_token_id
     model.config.eos_token_id = tokenizer.eos_token_id
     model.config.vocab_size = tokenizer.vocab_size
     model.main_input_name = "input_ids"
-    generation_config = GenerationConfig(
-        max_length=args.max_caption_length,
-        num_beams=5,
-        decoder_start_token_id=model.config.decoder_start_token_id,
-        pad_token_id=tokenizer.pad_token_id,
-        eos_token_id=tokenizer.eos_token_id,
-        no_repeat_ngram_size=3,
-        length_penalty=1.0,
-    )
-    model.generation_config = generation_config
+    
+    # 图像预处理
     def pil_to_tensor_transform(img):
         transform = transforms.Compose([
             transforms.Resize((224, 224)),
@@ -200,6 +305,7 @@ def main():
     train_ds = CaptionDataset(split="train", num_samples=args.num_train_samples, dataset_name=args.dataset_name)
     eval_ds = CaptionDataset(split="test", num_samples=args.num_eval_samples, dataset_name=args.dataset_name)
     rouge = evaluate.load("rouge")
+    
     def compute_metrics(pred):
         labels_ids = pred.label_ids
         pred_ids = pred.predictions
@@ -228,11 +334,14 @@ def main():
             "bleu1": round(np.mean(bleu_1_scores), 4),
             "bleu4": round(np.mean(bleu_4_scores), 4),
         })
+        
+        # Print up to 5 predictions and labels for debugging
         for i, (ref, pred) in enumerate(zip(label_str, pred_str)):
             if i in [0, 5, 10, 15, 20, 25]:  
                 print(f"Sample {i + 1}:")
                 print(f"  Reference: {ref}")
                 print(f"  Prediction: {pred}\n")
+        
         return results
     train_batch_size = args.per_device_train_batch_size
     num_train_epochs = args.num_train_epochs
@@ -240,6 +349,7 @@ def main():
     steps_per_epoch = (num_train_samples + train_batch_size - 1) // train_batch_size
     total_steps = steps_per_epoch * num_train_epochs
     warmup_steps = int(total_steps * args.warmup_ratio)
+    
     training_args = MySeq2SeqTrainingArguments(
         output_dir=args.output_dir,
         train_batch_size=args.per_device_train_batch_size,
@@ -289,7 +399,10 @@ def main():
             with torch.no_grad():
                 generated_ids = model.generate(
                     input_ids=input_ids.to(model.device),
-                    generation_config=generation_config,
+                    max_length=args.max_caption_length,
+                    num_beams=5,
+                    no_repeat_ngram_size=3,
+                    length_penalty=1.0,
                 )
                 generated_caption = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
             print(f"\n样例 {i+1}:")
