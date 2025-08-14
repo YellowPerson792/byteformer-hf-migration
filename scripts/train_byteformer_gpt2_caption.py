@@ -6,8 +6,11 @@ ByteFormer + GPT2 Caption Training Script
 python byteformer-hf-migration/scripts/train_byteformer_gpt2_caption.py --per_device_train_batch_size 8 --per_device_eval_batch_size 8 --num_train_epochs 3 --learning_rate 5e-5 --eval_steps 600 --logging_steps 50 --save_steps 600 --lr_scheduler_type cosine --gradient_accumulation_steps 2 --report_to none --max_caption_length 16 --num_eval_samples 50 --fp16
 """
 
-import sys
 import os
+# 设置环境变量以避免tokenizers并行化警告
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+import sys
 import argparse
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 import torch
