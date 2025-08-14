@@ -169,9 +169,14 @@ def main():
     byteformer_model.model.load_state_dict(pretrained_state, strict=False)
     
     byteformer_encoder = byteformer_model.model
+    
     # Remove the classifier if it exists
     if hasattr(byteformer_encoder, 'classifier'):
         delattr(byteformer_encoder, 'classifier')
+       # Remove specified downsampling layers from the encoder (去掉最后两个降采样层)
+    if hasattr(byteformer_encoder, 'downsamplers'):
+        if "downsample_9" in byteformer_model.model.downsamplers:
+            byteformer_encoder.downsamplers.pop("downsample_9")
     
     gpt2_config = GPT2Config.from_pretrained(args.gpt2_model)
     gpt2_config.add_cross_attention = True
@@ -196,11 +201,12 @@ def main():
     generation_config = GenerationConfig(
         max_length=args.max_caption_length,
         num_beams=5,
-        no_repeat_ngram_size=3,
         decoder_start_token_id=model.config.decoder_start_token_id,
         bos_token_id=tokenizer.bos_token_id,
         pad_token_id=tokenizer.pad_token_id,
         eos_token_id=tokenizer.eos_token_id,
+        no_repeat_ngram_size=3,
+        length_penalty=1.0,      # 长度惩罚
     )
     model.generation_config = generation_config
     
@@ -258,7 +264,7 @@ def main():
         input_ids = collated["samples"]
         caption_tokens = tokenizer(
             captions,
-            padding='max_length',
+            padding='longest',
             max_length=args.max_caption_length,
             truncation=True,
             return_tensors="pt"
@@ -328,7 +334,6 @@ def main():
     total_steps = steps_per_epoch * num_train_epochs
     warmup_steps = int(total_steps * args.warmup_ratio)
     
-    # Training Arguments
     training_args = MySeq2SeqTrainingArguments(
         output_dir=args.output_dir,
         train_batch_size=args.per_device_train_batch_size,
@@ -363,6 +368,9 @@ def main():
     print(f"验证样本数: {len(eval_ds)}")
     print(f"训练参数: {training_args}")
     
+    print("模型结构:")
+    print(model)
+    
     # Start training
     trainer.train()
     trainer.save_model()
@@ -381,7 +389,7 @@ def main():
             corenet_item = {"samples": img_tensor, "targets": torch.tensor(0)}
             
             collated = byteformer_image_collate_fn([corenet_item], opts)
-            input_ids = collated["samples"].long().unsqueeze(0)
+            input_ids = collated["samples"].unsqueeze(0)
             
             # Generate caption
             with torch.no_grad():
