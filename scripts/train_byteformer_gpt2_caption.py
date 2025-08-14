@@ -3,7 +3,7 @@ ByteFormer + GPT2 Caption Training Script
 使用ByteFormer作为encoder，GPT2作为decoder实现图像描述生成任务
 
 示例运行命令：
-python byteformer-hf-migration/scripts/train_byteformer_gpt2_caption.py --per_device_train_batch_size 8 --per_device_eval_batch_size 16 --num_train_epochs 3 --learning_rate 5e-5 --eval_steps 200 --logging_steps 50 --save_steps 600 --lr_scheduler_type cosine --gradient_accumulation_steps 2 --report_to none --max_caption_length 16 --num_eval_samples 50
+python byteformer-hf-migration/scripts/train_byteformer_gpt2_caption.py --per_device_train_batch_size 8 --per_device_eval_batch_size 8 --num_train_epochs 3 --learning_rate 5e-5 --eval_steps 600 --logging_steps 50 --save_steps 600 --lr_scheduler_type cosine --gradient_accumulation_steps 2 --report_to none --max_caption_length 16 --num_eval_samples 50 --fp16
 """
 
 import sys
@@ -115,7 +115,7 @@ def parse_args():
     parser.add_argument("--gradient_accumulation_steps", type=int, default=2, help="梯度累积步数")
     parser.add_argument("--learning_rate", type=float, default=5e-5, help="学习率")
     parser.add_argument("--lr_scheduler_type", type=str, default="linear", choices=["linear", "cosine", "constant"], help="学习率调度器类型")
-    parser.add_argument("--warmup_ratio", type=float, default=0.1, help="预热比例")
+    parser.add_argument("--warmup_ratio", type=float, default=0, help="预热比例")
     parser.add_argument("--fp16", action="store_true", default=False, help="启用FP16混合精度")
     parser.add_argument("--bf16", action="store_true", default=False, help="启用BF16混合精度")
     parser.add_argument("--evaluation_strategy", type=str, default="steps", choices=["no", "steps", "epoch"], help="评估策略")
@@ -165,9 +165,14 @@ def main():
     byteformer_model.model.load_state_dict(pretrained_state, strict=False)
     
     byteformer_encoder = byteformer_model.model
+    
     # Remove the classifier if it exists
     if hasattr(byteformer_encoder, 'classifier'):
         delattr(byteformer_encoder, 'classifier')
+       # Remove specified downsampling layers from the encoder (去掉最后两个降采样层)
+    if hasattr(byteformer_encoder, 'downsamplers'):
+        if "downsample_9" in byteformer_model.model.downsamplers:
+            byteformer_encoder.downsamplers.pop("downsample_9")
     
     gpt2_config = GPT2Config.from_pretrained(args.gpt2_model)
     gpt2_config.add_cross_attention = True
@@ -191,12 +196,13 @@ def main():
     # Setup generation config
     generation_config = GenerationConfig(
         max_length=args.max_caption_length,
-        num_beams=4,
-        no_repeat_ngram_size=3,
+        num_beams=5,
         decoder_start_token_id=model.config.decoder_start_token_id,
         bos_token_id=tokenizer.bos_token_id,
         pad_token_id=tokenizer.pad_token_id,
         eos_token_id=tokenizer.eos_token_id,
+        no_repeat_ngram_size=3,
+        length_penalty=1.0,      # 长度惩罚
     )
     model.generation_config = generation_config
     
@@ -254,7 +260,7 @@ def main():
         input_ids = collated["samples"]
         caption_tokens = tokenizer(
             captions,
-            padding='max_length',
+            padding='longest',
             max_length=args.max_caption_length,
             truncation=True,
             return_tensors="pt"
@@ -316,7 +322,14 @@ def main():
         
         return results
     
-    # Training Arguments
+    # 计算总训练步数，实现真正的 warmup_ratio
+    train_batch_size = args.per_device_train_batch_size
+    num_train_epochs = args.num_train_epochs
+    num_train_samples = len(train_ds)
+    steps_per_epoch = (num_train_samples + train_batch_size - 1) // train_batch_size
+    total_steps = steps_per_epoch * num_train_epochs
+    warmup_steps = int(total_steps * args.warmup_ratio)
+    
     training_args = MySeq2SeqTrainingArguments(
         output_dir=args.output_dir,
         train_batch_size=args.per_device_train_batch_size,
@@ -330,7 +343,7 @@ def main():
         eval_steps=args.eval_steps,
         eval_strategy=args.evaluation_strategy,
         lr_scheduler_type=args.lr_scheduler_type,
-        warmup_steps=int(args.warmup_ratio * 1000),
+        warmup_steps=warmup_steps,
         fp16=args.fp16,
         bf16=args.bf16,
         report_to=args.report_to if args.report_to not in [None, "none"] else None,
@@ -341,8 +354,8 @@ def main():
         args=training_args,
         train_dataset=train_ds,
         eval_dataset=eval_ds,
-        data_collator=caption_collate_fn,
         tokenizer=tokenizer,
+        data_collator=caption_collate_fn,
         compute_metrics=compute_metrics,
     )
     
@@ -350,6 +363,9 @@ def main():
     print(f"训练样本数: {len(train_ds)}")
     print(f"验证样本数: {len(eval_ds)}")
     print(f"训练参数: {training_args}")
+    
+    print("模型结构:")
+    print(model)
     
     # Start training
     trainer.train()
@@ -367,11 +383,9 @@ def main():
             
             # Process through pipeline
             corenet_item = {"samples": img_tensor, "targets": torch.tensor(0)}
-            pil_save_transform = PILSave(opts)
-            processed_item = pil_save_transform(corenet_item)
             
-            collated = byteformer_image_collate_fn([processed_item], opts)
-            input_ids = collated["samples"].long().unsqueeze(0)
+            collated = byteformer_image_collate_fn([corenet_item], opts)
+            input_ids = collated["samples"].unsqueeze(0)
             
             # Generate caption
             with torch.no_grad():

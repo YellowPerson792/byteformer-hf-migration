@@ -2,10 +2,7 @@
 ByteFormer HuggingFace Migration Training Script
 示例运行命令：
 # 基础训练（使用全部数据）
-python byteformer-hf-migration/scripts/train_hf_byteformer_cls.py --per_device_train_batch_size 8 --per_device_eval_batch_size 16 --num_train_epochs 3 --learning_rate 5e-5 --eval_steps 100 --logging_steps 50 --save_steps 500 --lr_scheduler_type linear --gradient_accumulation_steps 1 --num_train_samples 6000 --num_eval_samples 100 --report_to none
-
-# 快速测试（限制数据量）
-python byteformer-hf-migration/scripts/train_hf_byteformer_cls.py --per_device_train_batch_size 4 --num_train_epochs 1 --num_train_samples 1000 --num_eval_samples 200 --eval_steps 100 --logging_steps 10 --save_steps 500 --report_to none
+python byteformer-hf-migration/scripts/train_hf_byteformer_cls.py --per_device_train_batch_size 8 --per_device_eval_batch_size 16 --num_train_epochs 3 --learning_rate 5e-3 --eval_steps 100 --logging_steps 50 --save_steps 500 --lr_scheduler_type linear --gradient_accumulation_steps 1 --num_train_samples 6000 --num_eval_samples 100 --report_to none
 
 """
 
@@ -31,70 +28,28 @@ torchtext.disable_torchtext_deprecation_warning()
 def parse_args():
     """解析命令行参数"""
     parser = argparse.ArgumentParser(description="ByteFormer HuggingFace Migration Training")
-    
-    # Model and data configuration
-    parser.add_argument("--config", type=str, 
-                       default="byteformer-hf-migration/configs/conv_kernel_size=4,window_sizes=[128].yaml",
-                       help="CoreNet配置文件路径")
-    parser.add_argument("--weights", type=str,
-                       default="byteformer-hf-migration/weights/imagenet_jpeg_q60_k4_w128.pt", 
-                       help="预训练权重文件路径")
-    parser.add_argument("--num_classes", type=int, default=1000,
-                       help="分类类别数")
-    
-    # Data configuration
-    parser.add_argument("--num_train_samples", type=int, default=None,
-                       help="训练样本数量（None表示使用全部训练数据）")
-    parser.add_argument("--num_eval_samples", type=int, default=None,
-                       help="评估样本数量（None表示使用全部验证数据）")
-    
-    # Training configuration  
-    parser.add_argument("--output_dir", type=str, default="./byteformer_hf_training",
-                       help="训练输出目录")
-    parser.add_argument("--num_train_epochs", type=int, default=3,
-                       help="训练轮数")
-    parser.add_argument("--per_device_train_batch_size", type=int, default=8,
-                       help="每设备训练批大小")
-    parser.add_argument("--per_device_eval_batch_size", type=int, default=16,
-                       help="每设备验证批大小")
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=1,
-                       help="梯度累积步数")
-    
-    # Optimization parameters (simplified)
-    parser.add_argument("--learning_rate", type=float, default=5e-5,
-                       help="学习率")
-    
-    # Scheduling (simplified)
-    parser.add_argument("--lr_scheduler_type", type=str, default="linear",
-                       choices=["linear", "cosine", "constant"],
-                       help="学习率调度器类型")
-    parser.add_argument("--warmup_ratio", type=float, default=0.1,
-                       help="预热比例")
-    
-    # Mixed precision
-    parser.add_argument("--fp16", action="store_true", default=False,
-                       help="启用FP16混合精度")
-    parser.add_argument("--bf16", action="store_true", default=False,
-                       help="启用BF16混合精度")
-    
-    # Evaluation and logging
-    parser.add_argument("--evaluation_strategy", type=str, default="steps",
-                       choices=["no", "steps", "epoch"],
-                       help="评估策略")
-    parser.add_argument("--eval_steps", type=int, default=100,
-                       help="评估步数间隔")
-    parser.add_argument("--logging_steps", type=int, default=50,
-                       help="日志步数间隔")
-    parser.add_argument("--save_steps", type=int, default=500,
-                       help="保存步数间隔")
-    parser.add_argument("--save_total_limit", type=int, default=3,
-                       help="保存检查点总数限制")
-    
-    # Logging and monitoring
-    parser.add_argument("--report_to", type=str, default=None,
-                       choices=[None, "none", "wandb", "tensorboard"],
-                       help="日志报告工具")
-    
+    parser.add_argument("--config", type=str, default="byteformer-hf-migration/configs/conv_kernel_size=4,window_sizes=[128].yaml", help="CoreNet配置文件路径")
+    parser.add_argument("--weights", type=str, default="byteformer-hf-migration/weights/imagenet_jpeg_q60_k4_w128.pt", help="预训练权重文件路径")
+    parser.add_argument("--num_classes", type=int, default=1000, help="分类类别数")
+    parser.add_argument("--num_train_samples", type=int, default=None, help="训练样本数量（None表示使用全部训练数据）")
+    parser.add_argument("--num_eval_samples", type=int, default=None, help="评估样本数量（None表示使用全部验证数据）")  
+    parser.add_argument("--output_dir", type=str, default="./byteformer_hf_training", help="训练输出目录")
+    parser.add_argument("--num_train_epochs", type=int, default=3, help="训练轮数")
+    parser.add_argument("--per_device_train_batch_size", type=int, default=8, help="每设备训练批大小")
+    parser.add_argument("--per_device_eval_batch_size", type=int, default=16, help="每设备验证批大小")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1, help="梯度累积步数")
+    parser.add_argument("--learning_rate", type=float, default=5e-5, help="学习率")
+    parser.add_argument("--lr_scheduler_type", type=str, default="linear", choices=["linear", "cosine", "constant"], help="学习率调度器类型")
+    parser.add_argument("--warmup_ratio", type=float, default=0.1, help="预热比例")
+    parser.add_argument("--fp16", action="store_true", default=False, help="启用FP16混合精度")
+    parser.add_argument("--bf16", action="store_true", default=False, help="启用BF16混合精度")
+    parser.add_argument("--evaluation_strategy", type=str, default="steps", choices=["no", "steps", "epoch"], help="评估策略")
+    parser.add_argument("--eval_steps", type=int, default=100, help="评估步数间隔")
+    parser.add_argument("--logging_steps", type=int, default=50, help="日志步数间隔")
+    parser.add_argument("--save_steps", type=int, default=500, help="保存步数间隔")
+    parser.add_argument("--save_total_limit", type=int, default=3, help="保存检查点总数限制")
+    parser.add_argument("--report_to", type=str, default=None, choices=[None, "none", "wandb", "tensorboard"], help="日志报告工具")
+
     return parser.parse_args()
 
 def main():
@@ -118,7 +73,6 @@ def main():
         "--model.classification.n-classes", str(args.num_classes),
         "--dataset.root-train", "./mnist_data",
         "--dataset.root-val", "./mnist_data",
-        # 添加其他核心训练参数
         "--common.accum-freq", str(args.gradient_accumulation_steps),
         "--common.log-freq", str(args.logging_steps),
     ]
@@ -129,14 +83,10 @@ def main():
     hf_config = CorenetToHFPretrainedConfig(**vars(opts))
     model = CorenetToHFPretrainedModel(hf_config, vocab_size)
     weights = torch.load(args.weights, map_location='cpu')
-    # 由于类别数不匹配，只加载backbone部分
     model_state = model.model.state_dict()
     pretrained_state = {k: v for k, v in weights.items() if k in model_state and model_state[k].shape == v.shape}
     model.model.load_state_dict(pretrained_state, strict=False)
     model.train()
-
-    # 使用配置文件中定义的PILSave变换
-    pil_save_transform = PILSave(opts)
     
     # 图像预处理：将PIL图像转换为tensor格式以适配PILSave
     def pil_to_tensor_transform(img):
@@ -153,10 +103,8 @@ def main():
         def __init__(self, split="train", num_classes=1000, num_samples=None):
             self.dataset = load_dataset("uoft-cs/cifar10", split=split)
             self.num_classes = num_classes
-            
-            # 限制数据集大小
+
             if num_samples is not None and num_samples < len(self.dataset):
-                # 使用前num_samples个样本
                 self.dataset = self.dataset.select(range(num_samples))
                 print(f"使用 {split} 数据集的前 {num_samples} 个样本")
             else:
@@ -179,19 +127,15 @@ def main():
 
     def bitstream_collate_fn(batch):
         """Custom collate function for HF trainer compatibility"""
-        # Extract images and labels from batch
         images = []
         labels = []
         for item in batch:
             images.append(item['input_ids'])
             labels.append(item['labels'])
-        
-        # Process images through CoreNet pipeline
+
         corenet_batch = []
         for img_tensor, label in zip(images, labels):
-            # img_tensor = img_tensor.clamp(0, 1)
             corenet_batch.append({"samples": img_tensor, "targets": label})
-        
         
         collated = byteformer_image_collate_fn(corenet_batch, opts)
         input_ids = collated["samples"]
@@ -208,51 +152,54 @@ def main():
     # Custom Training Arguments - simplified version based on test.py
     training_args = MySeq2SeqTrainingArguments(
         output_dir=args.output_dir,
-        
-        # Basic training configuration
         train_batch_size=args.per_device_train_batch_size,  # Use original parameter name
         eval_batch_size=args.per_device_eval_batch_size,   # Use original parameter name  
         num_train_epochs=args.num_train_epochs,
         learning_rate=args.learning_rate,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
-        
-        # Logging and evaluation
         logging_steps=args.logging_steps,
         save_steps=args.save_steps,
         save_total_limit=args.save_total_limit,
         eval_steps=args.eval_steps,
         eval_strategy=args.evaluation_strategy,
-        
-        # Scheduling - simplified
         lr_scheduler_type=args.lr_scheduler_type,
         warmup_steps=int(args.warmup_ratio * 1000),  # Convert ratio to steps roughly
-        
-        # Mixed precision
         fp16=args.fp16,
         bf16=args.bf16,
-        
-        # Reporting
         report_to=args.report_to if args.report_to not in [None, "none"] else None,
     )
     
     class ClsTrainer(MySeq2SeqTrainer):
         def evaluate(self, eval_dataset=None, desc="Eval", ignore_keys=None, metric_key_prefix: str = "eval"):
+            """正确的评估函数，计算损失和准确率"""
+            from torch.utils.data import DataLoader
+            
             eval_dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
             self.model.eval()
             device = self.device
+            
+            total_loss = 0.0
             correct = 0
             total = 0
+            num_batches = 0
             debug_samples = []  # 存储前几个样本的预测信息
             
             with torch.no_grad():
                 for batch_idx, batch in enumerate(eval_dataset):
                     input_ids = batch["input_ids"].to(device)
                     labels = batch["labels"].to(device)
-                    outputs = self.model(input_ids=input_ids, labels=labels)
-                    logits = outputs.logits if hasattr(outputs, 'logits') else outputs[1]
-                    preds = torch.argmax(logits, dim=-1)
                     
-                    # 统计准确率
+                    # 前向传播计算损失和logits
+                    outputs = self.model(input_ids=input_ids, labels=labels)
+                    loss = outputs.loss if hasattr(outputs, 'loss') else outputs[0]
+                    logits = outputs.logits if hasattr(outputs, 'logits') else outputs[1]
+                    
+                    # 累积损失
+                    total_loss += loss.item()
+                    num_batches += 1
+                    
+                    # 计算预测和准确率
+                    preds = torch.argmax(logits, dim=-1)
                     correct += (preds == labels).sum().item()
                     total += labels.size(0)
                     
@@ -275,10 +222,12 @@ def main():
                                 'top3_probs': top3_probs.cpu().tolist()
                             })
             
+            # 计算平均损失和准确率
+            avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
             acc = correct / total if total > 0 else 0.0
             
             # 打印调试信息
-            print(f"\n[Custom Eval] Accuracy: {acc:.4f} ({correct}/{total})")
+            print(f"\n[Custom Eval] Loss: {avg_loss:.4f}, Accuracy: {acc:.4f} ({correct}/{total})")
             print("=" * 60)
             print("前10个样本的预测结果：")
             print("-" * 60)
@@ -289,7 +238,16 @@ def main():
             print("=" * 60)
             
             self.model.train()
-            return acc
+
+            if self.compute_metrics is not None:
+                # 构造metrics字典
+                metrics = {
+                    "accuracy": acc,
+                    "samples": total
+                }
+                return avg_loss, metrics
+            else:
+                return avg_loss
     
     # Initialize custom trainer
     trainer = ClsTrainer(
@@ -305,11 +263,6 @@ def main():
     print(f"训练样本数: {len(train_ds)}")
     print(f"验证样本数: {len(eval_ds)}")
     print(f"训练参数: {training_args}")
-    
-    # 训练前进行初始评估，查看模型预训练状态
-    # print("\n=== 训练前初始评估 ===")
-    # initial_acc = trainer.evaluate(desc="Initial Eval")
-    # print(f"初始准确率: {initial_acc:.4f}")
     
     # Start training
     trainer.train()

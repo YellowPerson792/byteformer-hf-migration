@@ -320,14 +320,12 @@ def generate_captions(model, tokenizer, dataloader, args, device):
         max_length=args.max_length,
         num_beams=args.num_beams,
         temperature=args.temperature,
-        # top_p=args.top_p,
         do_sample=True if args.temperature > 1.0 else False,
         pad_token_id=tokenizer.pad_token_id,
         eos_token_id=tokenizer.eos_token_id,
         bos_token_id=tokenizer.bos_token_id,
         no_repeat_ngram_size=3,  # 防止重复3-gram
         early_stopping=True,     # 早停
-        length_penalty=1.0,      # 长度惩罚
     )
     
     total_samples = 0
