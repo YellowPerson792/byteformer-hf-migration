@@ -3,7 +3,7 @@ ByteFormer + T5 Caption Training Script
 使用ByteFormer作为encoder，T5作为decoder实现图像描述生成任务
 
 示例运行命令：
-python byteformer-hf-migration/scripts/train_byteformer_t5_caption.py --per_device_train_batch_size 8 --per_device_eval_batch_size 8 --num_train_epochs 3 --learning_rate 5e-5 --eval_steps 10 --logging_steps 50 --save_steps 600 --lr_scheduler_type cosine --gradient_accumulation_steps 2 --report_to none --max_caption_length 16 --num_eval_samples 50 --fp16
+python byteformer-hf-migration/scripts/train_byteformer_t5_caption_new.py --per_device_train_batch_size 8 --per_device_eval_batch_size 8 --num_train_epochs 3 --learning_rate 5e-5 --eval_steps 200 --logging_steps 50 --save_steps 600 --lr_scheduler_type cosine --gradient_accumulation_steps 2 --report_to none --max_caption_length 16 --num_eval_samples 50 --fp16
 """
 
 import os
@@ -31,7 +31,8 @@ from transformers import T5ForConditionalGeneration, T5Config, T5Tokenizer, Enco
 from transformers.models.encoder_decoder.configuration_encoder_decoder import EncoderDecoderConfig
 from transformers.generation.utils import GenerationMixin
 from transformers import PreTrainedModel
-from transformers.modeling_outputs import BaseModelOutput
+from transformers.modeling_outputs import BaseModelOutput, Seq2SeqLMOutput
+from transformers.cache_utils import Cache
 from peft import get_peft_model, LoraConfig, TaskType
 import evaluate
 import nltk
@@ -102,31 +103,110 @@ class ByteFormerWrapper(PreTrainedModel):
 
 
 class CustomT5ForConditionalGeneration(T5ForConditionalGeneration):
-    """Custom T5ForConditionalGeneration with proper reorder_cache implementation for beam search."""
-    
-    def _reorder_cache(self, past_key_values, beam_idx):
-        """
-        Reorder the cache for beam search.
-        
-        Args:
-            past_key_values: tuple of tuples, each inner tuple contains (key, value) tensors
-            beam_idx: tensor of shape [batch_size * num_beams] with beam indices
-        
-        Returns:
-            Reordered cache in the same format
-        """
-        if past_key_values is None:
-            return None
-            
-        reordered_past = ()
-        for layer_past in past_key_values:
-            # Each layer_past is a tuple of (key, value) tensors for self-attention and cross-attention
-            reordered_layer_past = tuple(
-                past_state.index_select(0, beam_idx.to(past_state.device)) 
-                for past_state in layer_past
-            )
-            reordered_past += (reordered_layer_past,)
-        return reordered_past
+
+    def forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        decoder_input_ids: Optional[torch.LongTensor] = None,
+        decoder_attention_mask: Optional[torch.BoolTensor] = None,
+        head_mask: Optional[torch.FloatTensor] = None,
+        decoder_head_mask: Optional[torch.FloatTensor] = None,
+        cross_attn_head_mask: Optional[torch.Tensor] = None,
+        encoder_outputs: Optional[tuple[tuple[torch.Tensor]]] = None,
+        encoder_hidden_states: Optional[torch.FloatTensor] = None,
+        encoder_attention_mask: Optional[torch.FloatTensor] = None,
+        past_key_values: Optional[Cache] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        decoder_inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+    ) -> Union[tuple[torch.FloatTensor], Seq2SeqLMOutput]:
+
+        use_cache = use_cache if use_cache is not None else self.config.use_cache
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        # FutureWarning: head_mask was separated into two input args - head_mask, decoder_head_mask
+        if head_mask is not None and decoder_head_mask is None:
+            if self.config.num_layers == self.config.num_decoder_layers:
+                decoder_head_mask = head_mask
+
+        hidden_states = encoder_hidden_states
+        if decoder_input_ids is None and decoder_inputs_embeds is None:
+            decoder_input_ids = input_ids if labels is None else labels
+
+        if self.model_parallel:
+            torch.cuda.set_device(self.decoder.first_device)
+
+        # Set device for model parallelism
+        if self.model_parallel:
+            torch.cuda.set_device(self.decoder.first_device)
+            hidden_states = hidden_states.to(self.decoder.first_device)
+            if decoder_input_ids is not None:
+                decoder_input_ids = decoder_input_ids.to(self.decoder.first_device)
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(self.decoder.first_device)
+            if decoder_attention_mask is not None:
+                decoder_attention_mask = decoder_attention_mask.to(self.decoder.first_device)
+
+        # Decode
+        decoder_outputs = self.decoder(
+            input_ids=decoder_input_ids,
+            attention_mask=decoder_attention_mask,
+            inputs_embeds=decoder_inputs_embeds,
+            past_key_values=past_key_values,
+            encoder_hidden_states=hidden_states,
+            encoder_attention_mask=encoder_attention_mask,
+            head_mask=decoder_head_mask,
+            cross_attn_head_mask=cross_attn_head_mask,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            cache_position=cache_position,
+        )
+
+        sequence_output = decoder_outputs[0]
+
+        # Set device for model parallelism
+        if self.model_parallel:
+            torch.cuda.set_device(self.encoder.first_device)
+            self.lm_head = self.lm_head.to(self.encoder.first_device)
+            sequence_output = sequence_output.to(self.lm_head.weight.device)
+
+        if self.config.tie_word_embeddings:
+            # Rescale output before projecting on vocab
+            # See https://github.com/tensorflow/mesh/blob/fa19d69eafc9a482aff0b59ddd96b025c0cb207d/mesh_tensorflow/transformer/transformer.py#L586
+            sequence_output = sequence_output * (self.model_dim**-0.5)
+
+        lm_logits = self.lm_head(sequence_output)
+
+        loss = None
+        if labels is not None:
+            from torch.nn import CrossEntropyLoss
+            loss_fct = CrossEntropyLoss(ignore_index=-100)
+            # move labels to correct device to enable PP
+            labels = labels.to(lm_logits.device)
+            loss = loss_fct(lm_logits.view(-1, lm_logits.size(-1)), labels.view(-1))
+            # TODO(thom): Add z_loss https://github.com/tensorflow/mesh/blob/fa19d69eafc9a482aff0b59ddd96b025c0cb207d/mesh_tensorflow/layers.py#L666
+
+        if not return_dict:
+            output = (lm_logits,) + decoder_outputs[1:] + encoder_outputs
+            return ((loss,) + output) if loss is not None else output
+
+        from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions
+        return CausalLMOutputWithCrossAttentions(
+            loss=loss,
+            logits=lm_logits,
+            past_key_values=decoder_outputs.past_key_values,
+            hidden_states=decoder_outputs.hidden_states,
+            attentions=decoder_outputs.attentions,
+            cross_attentions=decoder_outputs.cross_attentions,
+        )
 
 
 def parse_args():
@@ -204,16 +284,17 @@ def main():
     if hasattr(byteformer_encoder, 'classifier'):
         delattr(byteformer_encoder, 'classifier')
     
-    # 创建T5 Decoder
+    # 创建T5 Decoder（只取decoder部分）
     t5_config = T5Config.from_pretrained(args.t5_model)
-    t5_decoder = CustomT5ForConditionalGeneration.from_pretrained(args.t5_model, config=t5_config)
+    t5_full_model = CustomT5ForConditionalGeneration.from_pretrained(args.t5_model, config=t5_config)
+    # t5_decoder = t5_full_model.decoder  # 只使用decoder部分
     
     # 创建ByteFormer Encoder包装器
     encoder_config = CorenetToHFPretrainedConfig(**vars(opts))
     wrapped_encoder = ByteFormerWrapper(byteformer_encoder, encoder_config)
     
     # 创建EncoderDecoderModel
-    model = EncoderDecoderModel(encoder=wrapped_encoder, decoder=t5_decoder)
+    model = EncoderDecoderModel(encoder=wrapped_encoder, decoder=t5_full_model)
     
     # 创建tokenizer
     tokenizer = T5Tokenizer.from_pretrained(args.t5_model)
@@ -403,20 +484,6 @@ def main():
         bf16=args.bf16,
         report_to=args.report_to if args.report_to not in [None, "none"] else None,
     )
-
-    # 应用LoRA微调（如果启用）
-    if args.use_lora:
-        print("使用LoRA微调...")
-        lora_config = LoraConfig(
-            task_type=TaskType.SEQ_2_SEQ_LM,
-            inference_mode=False,
-            r=args.lora_r,
-            lora_alpha=args.lora_alpha,
-            lora_dropout=args.lora_dropout,
-            target_modules=["q", "v", "k", "o", "wi", "wo"],  # T5的目标模块
-        )
-        model = get_peft_model(model, lora_config)
-        model.print_trainable_parameters()
 
     # 创建Trainer
     trainer = MySeq2SeqTrainer(

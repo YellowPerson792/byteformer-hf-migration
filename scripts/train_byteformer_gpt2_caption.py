@@ -29,6 +29,7 @@ from corenet.data.collate_fns.byteformer_collate_functions import byteformer_ima
 from utils.hf_style_trainer import MySeq2SeqTrainer, MySeq2SeqTrainingArguments
 from transformers import GPT2LMHeadModel, GPT2Config, AutoTokenizer, EncoderDecoderModel, GenerationConfig
 from transformers.models.encoder_decoder.configuration_encoder_decoder import EncoderDecoderConfig
+from transformers.modeling_outputs import Seq2SeqLMOutput, BaseModelOutput
 from transformers.generation.utils import GenerationMixin
 from transformers import PreTrainedModel
 from peft import get_peft_model, LoraConfig, TaskType
@@ -71,6 +72,7 @@ class ByteFormerWrapper(PreTrainedModel):
                            存储在特殊属性中供EncoderDecoderModel使用
         """
         # 步骤1: 获取backbone输入 (embeddings + positional embeddings)
+
         x, key_padding_mask = self.byteformer.get_backbone_inputs(input_ids)
         
         # 步骤2: 通过transformer backbone
@@ -102,15 +104,14 @@ class CustomEncoderDecoderModel(EncoderDecoderModel):
     """
     自定义的EncoderDecoderModel，正确处理ByteFormer输出的attention mask
     """
-    
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.FloatTensor] = None,
         decoder_input_ids: Optional[torch.LongTensor] = None,
         decoder_attention_mask: Optional[torch.BoolTensor] = None,
-        encoder_outputs: Optional[tuple] = None,
-        past_key_values: Optional[tuple] = None,
+        encoder_outputs: Optional[tuple[torch.FloatTensor]] = None,
+        past_key_values: Optional[tuple[tuple[torch.FloatTensor]]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         decoder_inputs_embeds: Optional[torch.FloatTensor] = None,
         labels: Optional[torch.LongTensor] = None,
@@ -119,13 +120,16 @@ class CustomEncoderDecoderModel(EncoderDecoderModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         **kwargs,
-    ):
+    ) -> Union[tuple, Seq2SeqLMOutput]:
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         kwargs_encoder = {argument: value for argument, value in kwargs.items() if not argument.startswith("decoder_")}
+
         kwargs_decoder = {
             argument[len("decoder_") :]: value for argument, value in kwargs.items() if argument.startswith("decoder_")
         }
+        if "num_items_in_batch" in kwargs_encoder:
+            kwargs_decoder["num_items_in_batch"] = kwargs_encoder.pop("num_items_in_batch", None)
 
         if encoder_outputs is None:
             encoder_outputs = self.encoder(
@@ -138,20 +142,10 @@ class CustomEncoderDecoderModel(EncoderDecoderModel):
                 **kwargs_encoder,
             )
         elif isinstance(encoder_outputs, tuple):
-            from transformers.modeling_outputs import BaseModelOutput
             encoder_outputs = BaseModelOutput(*encoder_outputs)
 
         encoder_hidden_states = encoder_outputs[0]
-        
-        # 关键修改：检查encoder输出是否包含正确的attention mask
-        if hasattr(encoder_outputs, 'encoder_attention_mask'):
-            # 使用ByteFormer输出对应的attention mask
-            encoder_attention_mask = encoder_outputs.encoder_attention_mask
-        else:
-            # 回退到原始的attention mask（可能不正确）
-            encoder_attention_mask = attention_mask
-            
-        # encoder_attention_mask = None
+        encoder_attention_mask = getattr(encoder_outputs, "encoder_attention_mask", None)
 
         # optionally project encoder_hidden_states
         if (
@@ -168,12 +162,12 @@ class CustomEncoderDecoderModel(EncoderDecoderModel):
             if decoder_attention_mask is None:
                 decoder_attention_mask = decoder_input_ids.new_tensor(decoder_input_ids != self.config.pad_token_id)
 
-        # Decode - 使用正确的encoder attention mask，但不传递labels
+        # Decode
         decoder_outputs = self.decoder(
             input_ids=decoder_input_ids,
             attention_mask=decoder_attention_mask,
             encoder_hidden_states=encoder_hidden_states,
-            encoder_attention_mask=encoder_attention_mask,  # 使用正确的mask
+            encoder_attention_mask=attention_mask,
             inputs_embeds=decoder_inputs_embeds,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
@@ -183,7 +177,7 @@ class CustomEncoderDecoderModel(EncoderDecoderModel):
             **kwargs_decoder,
         )
 
-        # 使用原版的外部loss计算方式
+        # Compute loss independent from decoder (as some shift the logits inside them)
         loss = None
         if labels is not None:
             logits = decoder_outputs.logits if return_dict else decoder_outputs[0]
@@ -197,9 +191,8 @@ class CustomEncoderDecoderModel(EncoderDecoderModel):
             else:
                 return decoder_outputs + encoder_outputs
 
-        from transformers.modeling_outputs import Seq2SeqLMOutput
         return Seq2SeqLMOutput(
-            loss=loss,  # 使用外部计算的loss
+            loss=loss,
             logits=decoder_outputs.logits,
             past_key_values=decoder_outputs.past_key_values,
             decoder_hidden_states=decoder_outputs.hidden_states,
@@ -209,18 +202,6 @@ class CustomEncoderDecoderModel(EncoderDecoderModel):
             encoder_hidden_states=encoder_outputs.hidden_states,
             encoder_attentions=encoder_outputs.attentions,
         )
-    def get_output_embeddings(self):
-        return None
-    def set_output_embeddings(self, x):
-        pass
-    def gradient_checkpointing_enable(self):
-        pass
-    def gradient_checkpointing_disable(self):
-        pass
-    def _set_gradient_checkpointing(self, module, value):
-        pass
-    def tie_weights(self):
-        pass
 
 
 class CustomGPT2LMHeadModel(GPT2LMHeadModel):
