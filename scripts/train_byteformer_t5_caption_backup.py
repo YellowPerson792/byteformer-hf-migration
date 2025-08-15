@@ -3,7 +3,7 @@ ByteFormer + T5 Caption Training Script
 使用ByteFormer作为encoder，T5作为decoder实现图像描述生成任务
 
 示例运行命令：
-python byteformer-hf-migration/scripts/train_byteformer_t5_caption_new.py --per_device_train_batch_size 8 --per_device_eval_batch_size 8 --num_train_epochs 3 --learning_rate 5e-5 --eval_steps 200 --logging_steps 50 --save_steps 600 --lr_scheduler_type cosine --gradient_accumulation_steps 2 --report_to none --max_caption_length 16 --num_eval_samples 50 --fp16
+python byteformer-hf-migration/scripts/train_byteformer_t5_caption.py --per_device_train_batch_size 8 --per_device_eval_batch_size 8 --num_train_epochs 3 --learning_rate 5e-5 --eval_steps 200 --logging_steps 50 --save_steps 600 --lr_scheduler_type cosine --gradient_accumulation_steps 2 --report_to none --max_caption_length 16 --num_eval_samples 50 --fp16
 """
 
 import os
