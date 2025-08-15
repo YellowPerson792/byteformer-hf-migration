@@ -7,7 +7,7 @@ os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
 # 示例：下载 MNIST 数据集
 # 你可以替换为其他数据集名称和配置
-DATASET_NAME = "mnist"
+DATASET_NAME = "jxie/flickr8k"
 
 print(f"开始下载数据集: {DATASET_NAME} (所有split)，使用镜像源: {os.environ['HF_ENDPOINT']}")
 dataset = load_dataset(DATASET_NAME)
