@@ -3,7 +3,7 @@ ByteFormer + GPT2 Caption Training Script
 使用ByteFormer作为encoder，GPT2作为decoder实现图像描述生成任务
 
 示例运行命令：
-python byteformer-hf-migration/scripts/train_byteformer_gpt2_caption.py --per_device_train_batch_size 8 --per_device_eval_batch_size 8 --num_train_epochs 3 --learning_rate 5e-5 --eval_steps 200 --logging_steps 50 --save_steps 600 --lr_scheduler_type cosine --gradient_accumulation_steps 2 --report_to none --max_caption_length 16 --num_eval_samples 50 --fp16
+python byteformer-hf-migration/scripts/train_byteformer_gpt2_caption.py --per_device_train_batch_size 48 --per_device_eval_batch_size 48 --num_train_epochs 5 --learning_rate 1e-4 --warmup_ratio 0.01 --eval_steps 200 --logging_steps 50 --save_steps 600 --lr_scheduler_type cosine --gradient_accumulation_steps 2 --report_to wandb --max_caption_length 16 --num_eval_samples 50 --fp16 --dataset "/root/autodl-fs/AbdoTW___coco_2014"
 """
 
 import os
@@ -17,7 +17,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision import transforms
-from datasets import load_dataset
+from datasets import load_dataset, load_from_disk
 from PIL import Image
 import numpy as np
 from dataclasses import dataclass, field
@@ -236,7 +236,7 @@ def parse_args():
     parser.add_argument("--config", type=str, default="byteformer-hf-migration/configs/conv_kernel_size=4,window_sizes=[128].yaml", help="CoreNet配置文件路径")
     parser.add_argument("--weights", type=str, default="byteformer-hf-migration/weights/imagenet_jpeg_q60_k4_w128.pt", help="预训练权重文件路径")
     parser.add_argument("--gpt2_model", type=str, default="gpt2", help="GPT2模型名称")
-    parser.add_argument("--dataset_name", type=str, default="jxie/flickr8k", help="数据集名称")
+    parser.add_argument("--dataset", type=str, default="jxie/flickr8k", help="数据集名称")
     parser.add_argument("--num_train_samples", type=int, default=None, help="训练样本数量（None表示使用全部训练数据）")
     parser.add_argument("--num_eval_samples", type=int, default=None, help="评估样本数量（None表示使用全部验证数据）")
     parser.add_argument("--max_caption_length", type=int, default=50, help="最大caption长度")
@@ -274,7 +274,7 @@ def main():
     print(f"训练轮数: {args.num_train_epochs}")
     print(f"学习率: {args.learning_rate}")
     print(f"批大小: {args.per_device_train_batch_size}")
-    print(f"数据集: {args.dataset_name}")
+    print(f"数据集: {args.dataset}")
     print("=" * 50)
     
     corenet_args = [
@@ -350,11 +350,11 @@ def main():
         return transform(img)
     
     class CaptionDataset(torch.utils.data.Dataset):
-        def __init__(self, split="train", num_samples=None, dataset_name="jxie/flickr8k"):
+        def __init__(self, split="train", num_samples=None, dataset="jxie/flickr8k"):
             
             # 直接使用datasets对象，不预先加载所有数据
-            self.dataset = load_dataset(dataset_name, split=split)
-            self.dataset_name = dataset_name
+            self.dataset = load_dataset(dataset, split=split)
+            self.dataset_name = dataset
             self.split = split
             self.total_samples = len(self.dataset) * 5
             if num_samples is not None and num_samples < self.total_samples:
@@ -380,10 +380,44 @@ def main():
             
         def __len__(self):
             return self.total_samples
+        
+    class COCODataset(torch.utils.data.Dataset):
+        def __init__(self, split="train", num_samples=None, dataset="/root/autodl-fs/AbdoTW___coco_2014"):
+            # 直接使用datasets对象，不预先加载所有数据
+            self.dataset = load_from_disk(f"{dataset}/{split}")
+            self.dataset_name = dataset
+            self.split = split
+            self.total_samples = len(self.dataset) * 5
+            if num_samples is not None and num_samples < self.total_samples:
+                self.total_samples = num_samples
+                print(f"使用 {split} 数据集的前 {num_samples} 个样本")
+            else:
+                print(f"使用完整的 {split} 数据集，共 {self.total_samples} 个样本")
+                
+        def __getitem__(self, idx):
+            # 动态计算对应的数据集索引和caption索引
+            dataset_idx = idx // 5  # 每个图片对应5个caption
+            caption_idx = idx % 5   # caption编号 0-4
+            item = self.dataset[dataset_idx]
+            img = item["image"] if "image" in item else item["jpg"]
+            if img.mode != 'RGB':
+                img = img.convert('RGB')
+            img_tensor = pil_to_tensor_transform(img)
+            caption = item["caption"][caption_idx] if isinstance(item["caption"], list) else item["caption"]
+            return {
+                'image_tensor': img_tensor,
+                'caption': caption
+            }
+            
+        def __len__(self):
+            return self.total_samples
 
-    # 创建数据集
-    train_ds = CaptionDataset(split="train", num_samples=args.num_train_samples, dataset_name=args.dataset_name)
-    eval_ds = CaptionDataset(split="test", num_samples=args.num_eval_samples, dataset_name=args.dataset_name)
+    if args.dataset == "/root/autodl-fs/AbdoTW___coco_2014":
+        train_ds = COCODataset(split="train", num_samples=args.num_train_samples, dataset=args.dataset)
+        eval_ds = COCODataset(split="validation", num_samples=args.num_eval_samples, dataset=args.dataset)
+    else:
+        train_ds = CaptionDataset(split="train", num_samples=args.num_train_samples, dataset=args.dataset)
+        eval_ds = CaptionDataset(split="test", num_samples=args.num_eval_samples, dataset=args.dataset)
 
     def caption_collate_fn(batch):
         images = []
@@ -418,17 +452,21 @@ def main():
     def compute_metrics(pred):
         labels_ids = pred.label_ids
         pred_ids = pred.predictions
-        # Convert to numpy arrays if needed
-        if not isinstance(labels_ids, np.ndarray):
-            labels_ids = np.array(labels_ids)
-        if not isinstance(pred_ids, np.ndarray):
-            pred_ids = np.array(pred_ids)
+        
+        # Handle the case where pred_ids and labels_ids are lists of lists with different lengths
+        # Don't convert to numpy arrays directly as they have irregular shapes
+        
         # Decode predictions and labels
         pred_str = tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
-        # Replace -100 with pad token for decoding
+        
+        # Replace -100 with pad token for decoding in labels
         pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
-        labels_ids = np.where(labels_ids != -100, labels_ids, pad_token_id)
-        label_str = tokenizer.batch_decode(labels_ids, skip_special_tokens=True)
+        processed_labels = []
+        for label_seq in labels_ids:
+            processed_seq = [pad_token_id if token_id == -100 else token_id for token_id in label_seq]
+            processed_labels.append(processed_seq)
+        
+        label_str = tokenizer.batch_decode(processed_labels, skip_special_tokens=True)
         # Compute ROUGE if available
         results = {}
         rouge_output = rouge.compute(predictions=pred_str, references=label_str, rouge_types=["rouge2"])
