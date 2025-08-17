@@ -302,7 +302,7 @@ def parse_args():
     parser.add_argument("--num_eval_samples", type=int, default=None, help="评估样本数量（None表示使用全部验证数据）")
     parser.add_argument("--max_caption_length", type=int, default=50, help="最大caption长度")
     parser.add_argument("--max_byteformer_length", type=int, default=2048, help="ByteFormer最大输入长度")
-    parser.add_argument("--output_dir", type=str, default="./_trained_models/byteformer_t5_caption_v2", help="训练输出目录")
+    parser.add_argument("--output_dir", type=str, default="./checkpoints/byteformer_t5_caption_v2", help="训练输出目录")
     parser.add_argument("--num_train_epochs", type=int, default=3, help="训练轮数")
     parser.add_argument("--per_device_train_batch_size", type=int, default=4, help="每设备训练批大小")
     parser.add_argument("--per_device_eval_batch_size", type=int, default=8, help="每设备验证批大小")

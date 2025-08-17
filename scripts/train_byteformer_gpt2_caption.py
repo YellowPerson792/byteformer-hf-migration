@@ -3,7 +3,7 @@ ByteFormer + GPT2 Caption Training Script
 使用ByteFormer作为encoder，GPT2作为decoder实现图像描述生成任务
 
 示例运行命令：
-python byteformer-hf-migration/scripts/train_byteformer_gpt2_caption.py --per_device_train_batch_size 48 --per_device_eval_batch_size 48 --num_train_epochs 5 --learning_rate 1e-4 --warmup_ratio 0.01 --eval_steps 200 --logging_steps 50 --save_steps 600 --lr_scheduler_type cosine --gradient_accumulation_steps 2 --report_to wandb --max_caption_length 16 --num_eval_samples 50 --fp16 --dataset "/root/autodl-fs/AbdoTW___coco_2014"
+python byteformer-hf-migration/scripts/train_byteformer_gpt2_caption.py --per_device_train_batch_size 48 --per_device_eval_batch_size 48 --num_train_epochs 5 --learning_rate 5e-5 --warmup_ratio 0.01 --eval_steps 40 --logging_steps 50 --save_steps 600 --lr_scheduler_type cosine --gradient_accumulation_steps 2 --report_to none --max_caption_length 16 --num_eval_samples 50 --fp16 --pretrained_weights /root/autodl-tmp/corenet/_trained_models/byteformer_gpt2_caption
 """
 
 import os
@@ -167,7 +167,7 @@ class CustomEncoderDecoderModel(EncoderDecoderModel):
             input_ids=decoder_input_ids,
             attention_mask=decoder_attention_mask,
             encoder_hidden_states=encoder_hidden_states,
-            encoder_attention_mask=encoder_attention_mask,
+            encoder_attention_mask=attention_mask,  ## encoder_attention_mask 似乎会降低性能
             inputs_embeds=decoder_inputs_embeds,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
@@ -228,8 +228,7 @@ class CustomGPT2LMHeadModel(GPT2LMHeadModel):
             )
             reordered_past += (reordered_layer_past,)
         return reordered_past
-
-
+    
 def parse_args():
     """解析命令行参数"""
     parser = argparse.ArgumentParser(description="ByteFormer + GPT2 Caption Training")
@@ -241,7 +240,7 @@ def parse_args():
     parser.add_argument("--num_eval_samples", type=int, default=None, help="评估样本数量（None表示使用全部验证数据）")
     parser.add_argument("--max_caption_length", type=int, default=50, help="最大caption长度")
     parser.add_argument("--max_byteformer_length", type=int, default=2048, help="ByteFormer最大输入长度")
-    parser.add_argument("--output_dir", type=str, default="./_trained_models/byteformer_gpt2_caption", help="训练输出目录")
+    parser.add_argument("--output_dir", type=str, default="./checkpoints/byteformer_gpt2_caption", help="训练输出目录")
     parser.add_argument("--num_train_epochs", type=int, default=3, help="训练轮数")
     parser.add_argument("--per_device_train_batch_size", type=int, default=4, help="每设备训练批大小")
     parser.add_argument("--per_device_eval_batch_size", type=int, default=8, help="每设备验证批大小")
@@ -260,8 +259,120 @@ def parse_args():
     parser.add_argument("--lora_r", type=int, default=8, help="LoRA rank")
     parser.add_argument("--lora_alpha", type=int, default=32, help="LoRA alpha")
     parser.add_argument("--lora_dropout", type=float, default=0.1, help="LoRA dropout")
+    parser.add_argument("--pretrained_weights", type=str, default=None, help="预训练权重目录，用于继续训练")
     parser.add_argument("--report_to", type=str, default=None, choices=[None, "none", "wandb", "tensorboard"], help="日志报告工具")
     return parser.parse_args()
+    
+def load_trained_weights(model_path, model):
+    try:
+        # 尝试不同的权重文件路径
+        weight_files = [
+            f"{model_path}/pytorch_model.bin",
+            f"{model_path}/model.safetensors",
+            f"{model_path}/pytorch_model.safetensors"
+        ]
+        
+        loaded = False
+        for weight_file in weight_files:
+            if os.path.exists(weight_file):
+                print(f"Loading trained weights from {weight_file}")
+                if weight_file.endswith('.safetensors'):
+                    from safetensors.torch import load_file
+                    trained_weights = load_file(weight_file)
+                else:
+                    trained_weights = torch.load(weight_file, map_location='cpu')
+            
+                
+                # 加载权重，允许部分加载
+                missing_keys, unexpected_keys = model.load_state_dict(trained_weights, strict=False)
+                print(f"Loaded trained weights successfully!")
+                
+                if missing_keys:
+                    print(f"Missing keys: {len(missing_keys)} (these will use initialization values)")
+                    print("Missing key names:", missing_keys)
+                if unexpected_keys:
+                    print(f"Unexpected keys: {len(unexpected_keys)} (these will be ignored)")
+                loaded = True
+                break
+        
+        if not loaded:
+            print(f"No weight file found in {model_path}, using initialization weights only")
+            
+    except Exception as e:
+        print(f"Failed to load trained weights: {e}")
+        print("Using initialization weights only")
+    return model
+        
+# 图像预处理
+def pil_to_tensor_transform(img):
+    transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor()
+    ])
+    return transform(img)
+
+class CaptionDataset(torch.utils.data.Dataset):
+    def __init__(self, split="train", num_samples=None, dataset="jxie/flickr8k"):
+        
+        # 直接使用datasets对象，不预先加载所有数据
+        self.dataset = load_dataset(dataset, split=split)
+        self.dataset_name = dataset
+        self.split = split
+        self.total_samples = len(self.dataset) * 5
+        if num_samples is not None and num_samples < self.total_samples:
+            self.total_samples = num_samples
+            print(f"使用 {split} 数据集的前 {num_samples} 个样本")
+        else:
+            print(f"使用完整的 {split} 数据集，共 {self.total_samples} 个样本")
+            
+    def __getitem__(self, idx):
+        # 动态计算对应的数据集索引和caption索引
+        dataset_idx = idx // 5  # 每个图片对应5个caption
+        caption_idx = idx % 5   # caption编号 0-4
+        item = self.dataset[dataset_idx]
+        img = item["image"] if "image" in item else item["jpg"]
+        if img.mode != 'RGB':
+            img = img.convert('RGB')
+        img_tensor = pil_to_tensor_transform(img)
+        caption = item.get(f"caption_{caption_idx}", "")
+        return {
+            'image_tensor': img_tensor,
+            'caption': caption
+        }
+        
+    def __len__(self):
+        return self.total_samples
+    
+class COCODataset(torch.utils.data.Dataset):
+    def __init__(self, split="train", num_samples=None, dataset="/root/autodl-fs/AbdoTW___coco_2014"):
+        # 直接使用datasets对象，不预先加载所有数据
+        self.dataset = load_from_disk(f"{dataset}/{split}")
+        self.dataset_name = dataset
+        self.split = split
+        self.total_samples = len(self.dataset) * 5
+        if num_samples is not None and num_samples < self.total_samples:
+            self.total_samples = num_samples
+            print(f"使用 {split} 数据集的前 {num_samples} 个样本")
+        else:
+            print(f"使用完整的 {split} 数据集，共 {self.total_samples} 个样本")
+            
+    def __getitem__(self, idx):
+        # 动态计算对应的数据集索引和caption索引
+        dataset_idx = idx // 5  # 每个图片对应5个caption
+        caption_idx = idx % 5   # caption编号 0-4
+        item = self.dataset[dataset_idx]
+        img = item["image"] if "image" in item else item["jpg"]
+        if img.mode != 'RGB':
+            img = img.convert('RGB')
+        img_tensor = pil_to_tensor_transform(img)
+        caption = item["caption"][caption_idx] if isinstance(item["caption"], list) else item["caption"]
+        return {
+            'image_tensor': img_tensor,
+            'caption': caption
+        }
+        
+    def __len__(self):
+        return self.total_samples
 
 def main():
     args = parse_args()
@@ -315,6 +426,7 @@ def main():
     wrapped_encoder = ByteFormerWrapper(byteformer_encoder, encoder_config)
     
     model = CustomEncoderDecoderModel(encoder=wrapped_encoder, decoder=gpt2_decoder)
+
     
     tokenizer = AutoTokenizer.from_pretrained(args.gpt2_model)
     tokenizer.pad_token = tokenizer.eos_token
@@ -326,99 +438,9 @@ def main():
     model.config.vocab_size = tokenizer.vocab_size
     model.main_input_name = "input_ids"
     
-    # Setup generation config
-    generation_config = GenerationConfig(
-        max_length=args.max_caption_length,
-        num_beams=5,  # 使用beam search
-        decoder_start_token_id=model.config.decoder_start_token_id,
-        bos_token_id=tokenizer.bos_token_id,
-        pad_token_id=tokenizer.pad_token_id,
-        eos_token_id=tokenizer.eos_token_id,
-        no_repeat_ngram_size=3,
-        length_penalty=1.0,      # 长度惩罚
-        early_stopping=True,     # 早停
-        do_sample=False,         # 使用贪心搜索而不是采样（对beam search很重要）
-    )
-    model.generation_config = generation_config
+    if args.pretrained_weights:
+        model = load_trained_weights(args.pretrained_weights, model)
     
-    # 图像预处理
-    def pil_to_tensor_transform(img):
-        transform = transforms.Compose([
-            transforms.Resize((224, 224)),
-            transforms.ToTensor()
-        ])
-        return transform(img)
-    
-    class CaptionDataset(torch.utils.data.Dataset):
-        def __init__(self, split="train", num_samples=None, dataset="jxie/flickr8k"):
-            
-            # 直接使用datasets对象，不预先加载所有数据
-            self.dataset = load_dataset(dataset, split=split)
-            self.dataset_name = dataset
-            self.split = split
-            self.total_samples = len(self.dataset) * 5
-            if num_samples is not None and num_samples < self.total_samples:
-                self.total_samples = num_samples
-                print(f"使用 {split} 数据集的前 {num_samples} 个样本")
-            else:
-                print(f"使用完整的 {split} 数据集，共 {self.total_samples} 个样本")
-                
-        def __getitem__(self, idx):
-            # 动态计算对应的数据集索引和caption索引
-            dataset_idx = idx // 5  # 每个图片对应5个caption
-            caption_idx = idx % 5   # caption编号 0-4
-            item = self.dataset[dataset_idx]
-            img = item["image"] if "image" in item else item["jpg"]
-            if img.mode != 'RGB':
-                img = img.convert('RGB')
-            img_tensor = pil_to_tensor_transform(img)
-            caption = item.get(f"caption_{caption_idx}", "")
-            return {
-                'image_tensor': img_tensor,
-                'caption': caption
-            }
-            
-        def __len__(self):
-            return self.total_samples
-        
-    class COCODataset(torch.utils.data.Dataset):
-        def __init__(self, split="train", num_samples=None, dataset="/root/autodl-fs/AbdoTW___coco_2014"):
-            # 直接使用datasets对象，不预先加载所有数据
-            self.dataset = load_from_disk(f"{dataset}/{split}")
-            self.dataset_name = dataset
-            self.split = split
-            self.total_samples = len(self.dataset) * 5
-            if num_samples is not None and num_samples < self.total_samples:
-                self.total_samples = num_samples
-                print(f"使用 {split} 数据集的前 {num_samples} 个样本")
-            else:
-                print(f"使用完整的 {split} 数据集，共 {self.total_samples} 个样本")
-                
-        def __getitem__(self, idx):
-            # 动态计算对应的数据集索引和caption索引
-            dataset_idx = idx // 5  # 每个图片对应5个caption
-            caption_idx = idx % 5   # caption编号 0-4
-            item = self.dataset[dataset_idx]
-            img = item["image"] if "image" in item else item["jpg"]
-            if img.mode != 'RGB':
-                img = img.convert('RGB')
-            img_tensor = pil_to_tensor_transform(img)
-            caption = item["caption"][caption_idx] if isinstance(item["caption"], list) else item["caption"]
-            return {
-                'image_tensor': img_tensor,
-                'caption': caption
-            }
-            
-        def __len__(self):
-            return self.total_samples
-
-    if args.dataset == "/root/autodl-fs/AbdoTW___coco_2014":
-        train_ds = COCODataset(split="train", num_samples=args.num_train_samples, dataset=args.dataset)
-        eval_ds = COCODataset(split="validation", num_samples=args.num_eval_samples, dataset=args.dataset)
-    else:
-        train_ds = CaptionDataset(split="train", num_samples=args.num_train_samples, dataset=args.dataset)
-        eval_ds = CaptionDataset(split="test", num_samples=args.num_eval_samples, dataset=args.dataset)
-
     def caption_collate_fn(batch):
         images = []
         captions = [] 
@@ -446,9 +468,9 @@ def main():
             "input_ids": input_ids,
             "labels": labels,
         }
-    
+
     rouge = evaluate.load("rouge")
-    
+
     def compute_metrics(pred):
         labels_ids = pred.label_ids
         pred_ids = pred.predictions
@@ -496,6 +518,28 @@ def main():
                 print(f"  Prediction: {pred}\n")
         
         return results
+    
+    # Setup generation config
+    generation_config = GenerationConfig(
+        max_length=args.max_caption_length,
+        num_beams=5,  # 使用beam search
+        decoder_start_token_id=model.config.decoder_start_token_id,
+        bos_token_id=tokenizer.bos_token_id,
+        pad_token_id=tokenizer.pad_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+        no_repeat_ngram_size=3,
+        length_penalty=1.0,      # 长度惩罚
+        early_stopping=True,     # 早停
+        do_sample=False,         # 使用贪心搜索而不是采样（对beam search很重要）
+    )
+    model.generation_config = generation_config
+
+    if args.dataset == "/root/autodl-fs/AbdoTW___coco_2014":
+        train_ds = COCODataset(split="train", num_samples=args.num_train_samples, dataset=args.dataset)
+        eval_ds = COCODataset(split="validation", num_samples=args.num_eval_samples, dataset=args.dataset)
+    else:
+        train_ds = CaptionDataset(split="train", num_samples=args.num_train_samples, dataset=args.dataset)
+        eval_ds = CaptionDataset(split="test", num_samples=args.num_eval_samples, dataset=args.dataset)
     
     # 计算总训练步数，实现真正的 warmup_ratio
     train_batch_size = args.per_device_train_batch_size

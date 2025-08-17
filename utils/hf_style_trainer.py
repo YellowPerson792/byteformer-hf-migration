@@ -212,11 +212,7 @@ class MySeq2SeqTrainer:
 
         # 训练开始前的检查
         print(f"\n==== 训练前检查 ====")
-        print(f"模型设备: {next(self.model.parameters()).device}")
-        print(f"Trainer设备: {self.device}")
         print(f"模型类型: {type(self.model)}")
-        
-        # 检查可训练参数
         trainable_count = sum(1 for p in self.model.parameters() if p.requires_grad)
         total_count = sum(1 for p in self.model.parameters())
         print(f"可训练参数: {trainable_count} / {total_count}")
@@ -237,15 +233,6 @@ class MySeq2SeqTrainer:
                 # attention_mask支持
                 if 'attention_mask' in batch:
                     model_inputs['attention_mask'] = batch['attention_mask'].to(self.device)
-                
-                # 调试：第一个batch检查设备一致性
-                if global_step == 0:
-                    print(f"[DEBUG] 第一个batch设备检查:")
-                    print(f"  input_ids设备: {model_inputs[input_name].device}")
-                    print(f"  labels设备: {model_inputs['labels'].device}")
-                    if 'attention_mask' in model_inputs:
-                        print(f"  attention_mask设备: {model_inputs['attention_mask'].device}")
-                    print(f"  模型设备: {next(self.model.parameters()).device}")
                 
                 with torch.cuda.amp.autocast(enabled=use_amp, dtype=torch.bfloat16 if args.bf16 else torch.float16):
                     outputs = self.model(**model_inputs)
