@@ -3,7 +3,7 @@ ByteFormer + GPT2 Caption Training Script
 使用ByteFormer作为encoder，GPT2作为decoder实现图像描述生成任务
 
 示例运行命令：
-python byteformer-hf-migration/scripts/train_byteformer_gpt2_caption.py --per_device_train_batch_size 48 --per_device_eval_batch_size 48 --num_train_epochs 5 --learning_rate 5e-5 --warmup_ratio 0.01 --eval_steps 40 --logging_steps 50 --save_steps 600 --lr_scheduler_type cosine --gradient_accumulation_steps 2 --report_to none --max_caption_length 16 --num_eval_samples 50 --fp16 --pretrained_weights /root/autodl-tmp/corenet/_trained_models/byteformer_gpt2_caption
+python byteformer-hf-migration/scripts/train_byteformer_gpt2_caption.py --per_device_train_batch_size 48 --per_device_eval_batch_size 48 --num_train_epochs 5 --learning_rate 5e-5 --warmup_ratio 0.01 --eval_steps 40 --logging_steps 50 --save_steps 600 --lr_scheduler_type cosine --gradient_accumulation_steps 2 --report_to none --max_caption_length 16 --num_eval_samples 50 --fp16 --gpt2_model gpt2-medium --save_total_limit 2 --pretrained_weights /root/autodl-tmp/corenet/checkpoints/byteformer_gpt2_caption/checkpoint-1200
 """
 
 import os
@@ -145,7 +145,6 @@ class CustomEncoderDecoderModel(EncoderDecoderModel):
             encoder_outputs = BaseModelOutput(*encoder_outputs)
 
         encoder_hidden_states = encoder_outputs[0]
-        encoder_attention_mask = getattr(encoder_outputs, "encoder_attention_mask", None)
 
         # optionally project encoder_hidden_states
         if (

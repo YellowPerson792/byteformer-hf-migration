@@ -3,7 +3,7 @@ ByteFormer + GPT2 Prefix Caption Training Script
 使用ByteFormer作为encoder，GPT2作为decoder，使用prefix prompt方式实现图像描述生成任务
 
 示例运行命令：
-python byteformer-hf-migration/scripts/train_byteformer_gpt2_prefix_caption.py --per_device_train_batch_size 8 --per_device_eval_batch_size 4 --num_train_epochs 3 --learning_rate 5e-5 --eval_steps 200 --logging_steps 50 --save_steps 600 --lr_scheduler_type cosine --gradient_accumulation_steps 2 --report_to none --max_caption_length 16 --num_eval_samples 50 --fp16
+python byteformer-hf-migration/scripts/train_byteformer_gpt2_prefix_caption.py --per_device_train_batch_size 16 --per_device_eval_batch_size 16 --num_train_epochs 3 --learning_rate 5e-5 --eval_steps 100 --logging_steps 50 --save_steps 600 --lr_scheduler_type cosine --gradient_accumulation_steps 2 --report_to none --max_caption_length 16 --num_eval_samples 50 --fp16 --gpt2_model gpt2-medium
 """
 
 import os
@@ -48,8 +48,11 @@ CONFIG_MAPPING.register("byteformer", CorenetToHFPretrainedConfig)
 MODEL_MAPPING.register(CorenetToHFPretrainedConfig, CorenetToHFPretrainedModel)
 
 
-class ByteFormerEncoder(PreTrainedModel):
-    """ByteFormer包装器，用于prefix模式，返回完整序列特征"""
+class ByteFormerWrapper(PreTrainedModel):
+    """ByteFormer包装器，适配HuggingFace EncoderDecoderModel接口
+    
+    精确复用CoreNet ByteFormer的实现，只是去掉分类头，保留完整的特征表示
+    """
     def __init__(self, byteformer_model, config):
         super().__init__(config)
         self.byteformer = byteformer_model
@@ -59,45 +62,44 @@ class ByteFormerEncoder(PreTrainedModel):
         
     def forward(self, input_ids, attention_mask=None, **kwargs):
         """
-        前向传播，返回完整的序列特征用于prefix
+        前向传播，复用ByteFormer的backbone，但返回序列特征而不是分类结果
         
         Args:
             input_ids: 输入token序列 [batch_size, sequence_length]
-            attention_mask: 注意力掩码 (未使用，ByteFormer内部处理掩码)
+            attention_mask: 注意力掩码 (如果提供，将被忽略，因为ByteFormer内部处理掩码)
             
         Returns:
-            BaseModelOutput: 包含last_hidden_state的输出
+            BaseModelOutput: 包含last_hidden_state的输出，同时将encoder输出对应的mask
+                           存储在特殊属性中供EncoderDecoderModel使用
         """
         # 步骤1: 获取backbone输入 (embeddings + positional embeddings)
+
         x, key_padding_mask = self.byteformer.get_backbone_inputs(input_ids)
         
         # 步骤2: 通过transformer backbone
         x, updated_mask = self.byteformer.backbone_forward(x, key_padding_mask)
         
-        # 步骤3: 返回完整的序列特征，不进行池化
+        # 步骤3: 将ByteFormer的mask转换为标准的attention_mask格式
+        # updated_mask中，-inf表示被mask的位置，其他位置是0
+        # 转换为attention_mask: 1表示有效位置，0表示mask位置
+        encoder_output_attention_mask = (updated_mask != float("-inf")).float()
+        
+        # 步骤4: 返回完整的序列特征，而不是池化后的分类特征
         # x的形状是 [batch_size, sequence_length, hidden_size]
-        # 这样可以给decoder提供更丰富的序列信息作为虚拟token
+        # 这样可以给decoder提供更丰富的信息
         
         # 返回符合HuggingFace格式的输出
-        return BaseModelOutput(
-            last_hidden_state=x,  # [batch_size, sequence_length, hidden_size]
-            # 可选：添加注意力掩码信息
-            # attentions=None,  # ByteFormer不返回attention weights
+        from transformers.modeling_outputs import BaseModelOutput
+        output = BaseModelOutput(
+            last_hidden_state=x,
+            # 注意：我们将在collate函数中处理attention_mask的传递
         )
-    
-    def get_output_embeddings(self):
-        return None
-    def set_output_embeddings(self, x):
-        pass
-    def gradient_checkpointing_enable(self):
-        pass
-    def gradient_checkpointing_disable(self):
-        pass
-    def _set_gradient_checkpointing(self, module, value):
-        pass
-    def tie_weights(self):
-        pass
-
+        
+        # 在输出对象上添加encoder输出对应的attention mask
+        # 这是一个hack，但可以让EncoderDecoderModel访问到正确的mask
+        output.encoder_attention_mask = encoder_output_attention_mask
+        
+        return output
 
 class PrefixLMForCaption(PreTrainedModel, GenerationMixin):
     """Prefix LM模型，使用ByteFormer encoder + GPT2 decoder"""
@@ -156,6 +158,7 @@ class PrefixLMForCaption(PreTrainedModel, GenerationMixin):
             encoder_outputs = BaseModelOutput(*encoder_outputs)
 
         encoder_hidden_states = encoder_outputs[0]  # [batch_size, sequence_length, hidden_size]
+        encoder_attention_mask = getattr(encoder_outputs, "encoder_attention_mask", None)
 
         # 投影encoder输出到decoder维度（使用内部集成的投影层）
         encoder_hidden_states = self.encoder_decoder_proj(encoder_hidden_states)
@@ -175,8 +178,11 @@ class PrefixLMForCaption(PreTrainedModel, GenerationMixin):
             label_embeds = self.decoder.transformer.wte(labels_for_embeds)
             final_inputs_embeds = torch.cat([prefix_embeds, label_embeds], dim=1)
 
-            # 构造注意力mask：prefix全部为1，label部分用提供的mask，否则按 labels!=-100 构造
-            prefix_attention = torch.ones(prefix_embeds.shape[:2], dtype=torch.long, device=prefix_embeds.device)
+            # 构造注意力mask：prefix部分使用encoder_attention_mask，label部分用提供的mask，否则按 labels!=-100 构造
+            if encoder_attention_mask is not None:
+                prefix_attention = encoder_attention_mask.to(dtype=torch.long, device=prefix_embeds.device)
+            else:
+                prefix_attention = torch.ones(prefix_embeds.shape[:2], dtype=torch.long, device=prefix_embeds.device)
             if decoder_attention_mask is not None:
                 dec_attn = decoder_attention_mask.to(device=prefix_embeds.device, dtype=torch.long)
             else:
@@ -184,7 +190,10 @@ class PrefixLMForCaption(PreTrainedModel, GenerationMixin):
             final_attention_mask = torch.cat([prefix_attention, dec_attn], dim=1)
         elif decoder_inputs_embeds is not None:
             final_inputs_embeds = torch.cat([prefix_embeds, decoder_inputs_embeds], dim=1)
-            prefix_attention = torch.ones(prefix_embeds.shape[:2], dtype=torch.long, device=prefix_embeds.device)
+            if encoder_attention_mask is not None:
+                prefix_attention = encoder_attention_mask.to(dtype=torch.long, device=prefix_embeds.device)
+            else:
+                prefix_attention = torch.ones(prefix_embeds.shape[:2], dtype=torch.long, device=prefix_embeds.device)
             if decoder_attention_mask is not None:
                 final_attention_mask = torch.cat([prefix_attention, decoder_attention_mask.to(device=prefix_embeds.device, dtype=torch.long)], dim=1)
             else:
@@ -218,7 +227,7 @@ class PrefixLMForCaption(PreTrainedModel, GenerationMixin):
             # 跳过prefix部分，只计算caption部分的loss
             prefix_len = prefix_embeds.size(1)  # prefix的序列长度
             label_len = labels.size(1)
-            prediction_logits = logits[:, prefix_len-1:prefix_len+label_len-1, :]  # 跳过prefix位置，取caption部分
+            prediction_logits = logits[:, prefix_len-1:prefix_len+label_len-1, :]  
             # 将labels中的pad token替换为-100
             pad_token_id = getattr(self.decoder_tokenizer, 'pad_token_id', None)
             shift_labels = labels.clone()
@@ -318,8 +327,12 @@ class PrefixLMForCaption(PreTrainedModel, GenerationMixin):
         
         # 将prefix和start token组合
         current_embeds = torch.cat([prefix_embeds, start_embeds], dim=1)
-        # 创建attention mask: prefix部分全为1，start token部分也为1
-        prefix_attention = torch.ones(prefix_embeds.shape[:2], dtype=torch.long, device=device)
+        # 创建attention mask: prefix部分使用encoder_attention_mask，start token部分为1
+        encoder_attention_mask = getattr(encoder_outputs, "encoder_attention_mask", None)
+        if encoder_attention_mask is not None:
+            prefix_attention = encoder_attention_mask.to(dtype=torch.long, device=device)
+        else:
+            prefix_attention = torch.ones(prefix_embeds.shape[:2], dtype=torch.long, device=device)
         start_attention = torch.ones((batch_size, 1), dtype=torch.long, device=device)
         current_attention_mask = torch.cat([prefix_attention, start_attention], dim=1)
         
@@ -439,7 +452,7 @@ def main():
         delattr(byteformer_encoder, 'classifier')
     
     # 创建ByteFormer Encoder包装器
-    encoder = ByteFormerEncoder(byteformer_encoder, hf_config)
+    encoder = ByteFormerWrapper(byteformer_encoder, hf_config)
     
     # 创建GPT2 Decoder，明确指定 attn_implementation 为 "eager"
     gpt2_config = GPT2Config.from_pretrained(args.gpt2_model)
@@ -694,8 +707,12 @@ def main():
                     # 初始embeddings：prefix + start token
                     current_embeds = torch.cat([prefix_embeds, start_embeds], dim=1)
                     
-                    # 构造attention mask
-                    prefix_attention = torch.ones(prefix_embeds.shape[:2], dtype=torch.long, device=device)
+                    # 构造attention mask: 使用encoder_attention_mask
+                    encoder_attention_mask = getattr(encoder_outputs, "encoder_attention_mask", None)
+                    if encoder_attention_mask is not None:
+                        prefix_attention = encoder_attention_mask.to(dtype=torch.long, device=device)
+                    else:
+                        prefix_attention = torch.ones(prefix_embeds.shape[:2], dtype=torch.long, device=device)
                     start_attention = torch.ones((batch_size, 1), dtype=torch.long, device=device)
                     current_attention_mask = torch.cat([prefix_attention, start_attention], dim=1)
                     
